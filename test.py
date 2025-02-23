@@ -68,3 +68,325 @@ print("Mapped Journeys DataFrame:")
 print(mapped_journeys_df)
 print("\nPage Mapping:")
 print(page_mapping)
+
+
+
+
+
+import pandas as pd
+import numpy as np
+
+# -----------------------------------------------------
+# 1) Example DataFrame Setup (Simulated Example)
+# -----------------------------------------------------
+data = {
+    'journey_name':      ['JourneyA','JourneyA','JourneyA','JourneyB','JourneyB','JourneyC','JourneyC'],
+    'channel_visit_id':  [100,      100,       100,       200,       200,       300,       300],
+    'page_number':       [1,        2,         3,         1,         2,         1,         2],
+    'account_num':       [123,      123,       123,       456,       456,       789,       789],
+    'page_referrer':     [None,     'Home',    'Splash',  None,      'Login',   None,      'Home'],
+    'page':              ['Home',   'Splash',  'Products','Login',   'Dashboard','Home',   'Checkout'],
+    'next_page':         ['Splash','Products', 'Exit','Dashboard','Exit','Checkout','Exit'],
+    'time_spent_seconds':[10,       0.5,       5,         20,        15,        2,         0.3],
+    'is_exit':           [False,    False,     False,     False,     False,     False,     True]
+}
+
+df = pd.DataFrame(data)
+print("Original DataFrame:")
+print(df)
+print("-"*50)
+
+# -----------------------------------------------------
+# 2) Sort the DataFrame
+#    We'll use 'journey_name', 'channel_visit_id', and 'page_number'
+#    to ensure the visit order is correct.
+# -----------------------------------------------------
+df_sorted = df.sort_values(['journey_name','channel_visit_id','page_number'])
+print("Sorted DataFrame:")
+print(df_sorted)
+print("-"*50)
+
+# -----------------------------------------------------
+# 3) Define the build_valid_journey function
+#    We'll illustrate how to incorporate page_referrer (previous page),
+#    page (current), next_page (future), time_spent_seconds, and is_exit.
+# -----------------------------------------------------
+def build_valid_journey(group):
+    """
+    Build a valid journey for each user/group.
+    We'll create transitions of the form:
+      (page_referrer -> page) if not exit,
+      (page -> "Exit") if is_exit,
+    skipping rows with time_spent_seconds < 1 (example).
+    You could also incorporate next_page if desired.
+    """
+    journey = []
+
+    for row in group.itertuples():
+        # Convert columns to strings (in case of None)
+        ref_page = str(row.page_referrer) if row.page_referrer else "None"
+        current_page = str(row.page)
+        next_pg = str(row.next_page)
+
+        # Skip pages with very short time_spent_seconds (example logic)
+        if row.time_spent_seconds < 1:
+            continue
+
+        # Check if this row is an exit
+        is_exit = getattr(row, 'is_exit', False)
+
+        if is_exit:
+            # Mark the current page as leading to an exit
+            journey.append((current_page, "Exit"))
+        else:
+            # Normal transition using page_referrer -> page
+            # Alternatively, you could do (current_page -> next_page).
+            journey.append((ref_page, current_page))
+
+    return journey
+
+# -----------------------------------------------------
+# 4) Group by account_num and apply build_valid_journey
+# -----------------------------------------------------
+journeys = (
+    df_sorted
+    .groupby('account_num')
+    .apply(build_valid_journey)
+    .reset_index(name='journey')
+)
+
+print("Resulting 'journeys' DataFrame:")
+print(journeys)
+
+
+
+
+
+
+# Required Libraries
+import pandas as pd
+import numpy as np
+import networkx as nx
+import matplotlib.pyplot as plt
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+
+# --------------------------------------------
+# 1️⃣ Sample DataFrame: Customer Journeys
+# --------------------------------------------
+
+data = {
+    'journey_name': ['JourneyA', 'JourneyA', 'JourneyA', 'JourneyB', 'JourneyB', 'JourneyC', 'JourneyC'],
+    'channel_visit_id': [100, 100, 100, 200, 200, 300, 300],
+    'page_number': [1, 2, 3, 1, 2, 1, 2],
+    'account_num': [123, 123, 123, 456, 456, 789, 789],
+    'page_referrer': [None, 'Home', 'Splash', None, 'Login', None, 'Home'],
+    'page': ['Home', 'Splash', 'Products', 'Login', 'Dashboard', 'Home', 'Checkout'],
+    'next_page': ['Splash', 'Products', 'Exit', 'Dashboard', 'Exit', 'Checkout', 'Exit'],
+    'time_spent_seconds': [10.0, 0.5, 5.0, 20.0, 15.0, 2.0, 0.3],
+    'is_exit': [False, False, False, False, False, False, True]
+}
+
+df = pd.DataFrame(data)
+print("Sample DataFrame:\n", df)
+
+# --------------------------------------------
+# 2️⃣ Build the Graph from Journeys
+# --------------------------------------------
+
+# Create Directed Graph
+G = nx.DiGraph()
+
+# Add edges with weights (time spent)
+for idx, row in df.iterrows():
+    referrer = row['page_referrer'] if row['page_referrer'] else 'Start'
+    G.add_edge(referrer, row['page'], weight=row['time_spent_seconds'])
+
+# Visualize the Graph
+plt.figure(figsize=(10, 7))
+pos = nx.spring_layout(G, seed=42)
+edges = G.edges()
+weights = [G[u][v]['weight'] for u, v in edges]
+nx.draw(G, pos, with_labels=True, node_size=2000, node_color='skyblue', font_size=10, width=weights)
+nx.draw_networkx_edge_labels(G, pos, edge_labels={(u, v): f"{d['weight']:.1f}" for u, v, d in G.edges(data=True)})
+plt.title("Customer Journey Graph")
+plt.show()
+
+# --------------------------------------------
+# 3️⃣ Create Transition Matrices
+# --------------------------------------------
+
+# Pages and mapping
+pages = list(G.nodes())
+page_indices = {page: idx for idx, page in enumerate(pages)}
+
+# Initialize transition matrix
+transition_matrix = np.zeros((len(df['account_num'].unique()), len(pages)**2))
+
+# Build transition matrices for each account
+for idx, account in enumerate(df['account_num'].unique()):
+    user_df = df[df['account_num'] == account]
+    user_matrix = np.zeros((len(pages), len(pages)))
+
+    for _, row in user_df.iterrows():
+        referrer = row['page_referrer'] if row['page_referrer'] else 'Start'
+        i = page_indices[referrer]
+        j = page_indices[row['page']]
+        user_matrix[i, j] += 1
+
+    # Flatten the matrix to a vector
+    transition_matrix[idx, :] = user_matrix.flatten()
+
+# --------------------------------------------
+# 4️⃣ Scale and Apply Clustering (K-Means)
+# --------------------------------------------
+
+# Scale the data
+scaler = StandardScaler()
+scaled_matrix = scaler.fit_transform(transition_matrix)
+
+# Apply K-Means Clustering
+kmeans = KMeans(n_clusters=3, random_state=42)
+kmeans.fit(scaled_matrix)
+labels = kmeans.labels_
+
+# Display Clustering Results
+print("\nClustering Results:")
+for idx, account in enumerate(df['account_num'].unique()):
+    print(f"Account: {account}, Cluster: {labels[idx]}")
+
+# --------------------------------------------
+# 5️⃣ Visualize Clustered Customer Journeys
+# --------------------------------------------
+
+# Color map for clusters
+colors = ['red', 'green', 'blue']
+account_clusters = {acc: colors[labels[idx]] for idx, acc in enumerate(df['account_num'].unique())}
+
+# Plot user journeys with cluster colors
+plt.figure(figsize=(10, 7))
+for idx, account in enumerate(df['account_num'].unique()):
+    user_df = df[df['account_num'] == account]
+    user_G = nx.DiGraph()
+
+    for _, row in user_df.iterrows():
+        ref = row['page_referrer'] if row['page_referrer'] else 'Start'
+        user_G.add_edge(ref, row['page'])
+
+    nx.draw(user_G, pos, with_labels=True, node_size=2000, node_color=account_clusters[account], font_size=10)
+
+plt.title("Clustered Customer Journeys")
+plt.show()
+
+# --------------------------------------------
+# ✅ Done! You've clustered customer journeys.
+# --------------------------------------------
+
+
+
+
+
+
+
+
+import pandas as pd
+import numpy as np
+from tslearn.clustering import TimeSeriesKMeans
+from tslearn.metrics import dtw
+from sklearn.preprocessing import LabelEncoder
+import matplotlib.pyplot as plt
+import networkx as nx
+
+# Step 1: Prepare the DataFrame
+data = {
+    'journey_name': ['JourneyA', 'JourneyA', 'JourneyA', 'JourneyB', 'JourneyB', 'JourneyC', 'JourneyC'],
+    'channel_visit_id': [100, 100, 100, 200, 200, 300, 300],
+    'page_number': [1, 2, 3, 1, 2, 1, 2],
+    'account_num': [123, 123, 123, 456, 456, 789, 789],
+    'page_referrer': [None, 'Home', 'Splash', None, 'Login', None, 'Home'],
+    'page': ['Home', 'Splash', 'Products', 'Login', 'Dashboard', 'Home', 'Checkout'],
+    'next_page': ['Splash', 'Products', 'Exit', 'Dashboard', 'Exit', 'Checkout', 'Exit'],
+    'time_spent_seconds': [10.0, 0.5, 5.0, 20.0, 15.0, 2.0, 0.3],
+    'is_exit': [False, False, False, False, False, False, True]
+}
+
+df = pd.DataFrame(data)
+
+# Step 2: Encode page names to integers
+le = LabelEncoder()
+df['page_encoded'] = le.fit_transform(df['page'])
+
+# Step 3: Build sequences per account
+sequences = df.groupby('account_num')['page_encoded'].apply(list).tolist()
+account_ids = df['account_num'].unique()
+
+# Pad sequences to have the same length
+max_len = max(len(seq) for seq in sequences)
+sequences_padded = [seq + [0]*(max_len - len(seq)) for seq in sequences]
+
+# Convert to 3D numpy array for tslearn
+from tslearn.preprocessing import TimeSeriesResampler
+X = np.array(sequences_padded).reshape(len(sequences_padded), max_len, 1)
+
+# Step 4: Apply DTW-based KMeans Clustering
+n_clusters = 2  # Adjust as needed
+model = TimeSeriesKMeans(n_clusters=n_clusters, metric="dtw", random_state=42)
+labels = model.fit_predict(X)
+
+# Step 5: Visualize Clustered Sequences
+plt.figure(figsize=(10, 5))
+for yi in range(n_clusters):
+    plt.subplot(n_clusters, 1, yi + 1)
+    for xx in X[labels == yi]:
+        plt.plot(xx.ravel(), "k-", alpha=0.4)
+    plt.title(f"Cluster {yi + 1}")
+
+plt.tight_layout()
+plt.show()
+
+# Print cluster assignments
+for idx, label in enumerate(labels):
+    print(f"Account: {account_ids[idx]}, Cluster: {label}")
+
+# ------------------------------------------------------------
+# Optional Step 6: Build Markov Chains for each cluster
+# ------------------------------------------------------------
+def build_markov_chain(sequence):
+    transitions = {}
+    for i in range(len(sequence) - 1):
+        current_page = sequence[i]
+        next_page = sequence[i + 1]
+        if current_page not in transitions:
+            transitions[current_page] = {}
+        transitions[current_page][next_page] = transitions[current_page].get(next_page, 0) + 1
+
+    # Normalize probabilities
+    for current_page, next_pages in transitions.items():
+        total = sum(next_pages.values())
+        for next_page in next_pages:
+            transitions[current_page][next_page] /= total
+
+    return transitions
+
+# Build Markov Chains per cluster
+for cluster_id in range(n_clusters):
+    print(f"\nMarkov Chain for Cluster {cluster_id + 1}:")
+    cluster_sequences = [sequences[i] for i in range(len(labels)) if labels[i] == cluster_id]
+    combined_sequence = [page for seq in cluster_sequences for page in seq]
+    markov_chain = build_markov_chain(combined_sequence)
+
+    # Visualize as graph
+    G = nx.DiGraph()
+    for current_page, next_pages in markov_chain.items():
+        for next_page, prob in next_pages.items():
+            G.add_edge(le.inverse_transform([current_page])[0],
+                       le.inverse_transform([next_page])[0],
+                       weight=round(prob, 2))
+
+    pos = nx.spring_layout(G)
+    edge_labels = nx.get_edge_attributes(G, 'weight')
+    nx.draw(G, pos, with_labels=True, node_size=1500, node_color='skyblue')
+    nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels)
+    plt.title(f"Markov Chain for Cluster {cluster_id + 1}")
+    plt.show()
+
