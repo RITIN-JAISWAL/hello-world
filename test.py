@@ -780,3 +780,134 @@ embedder, losses = train_model(mapped_journeys_df, embed_dim=20, batch_size=4, e
 
 # Plot the loss
 plot_losses(losses)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+from scipy.cluster.hierarchy import linkage, dendrogram, fcluster
+import matplotlib.pyplot as plt
+
+# Assuming distances_captured is a condensed distance matrix
+Z = linkage(distances_captured, method='ward')  # 'ward' works well for Euclidean distances
+
+# Plot Dendrogram
+plt.figure(figsize=(10, 7))
+dendrogram(Z, truncate_mode='lastp', p=30, leaf_rotation=90., leaf_font_size=12.)
+plt.title('Hierarchical Clustering Dendrogram')
+plt.xlabel('Sample Index')
+plt.ylabel('Distance')
+plt.show()
+
+# Cut the dendrogram to form clusters
+from scipy.cluster.hierarchy import fcluster
+clusters = fcluster(Z, t=5, criterion='maxclust')  # t=5 defines the number of clusters
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+from sklearn.cluster import DBSCAN
+from sklearn.preprocessing import StandardScaler
+
+# Normalize distances
+scaler = StandardScaler()
+distances_scaled = scaler.fit_transform(distances_captured.reshape(-1, 1))
+
+# DBSCAN
+dbscan = DBSCAN(eps=0.5, min_samples=5, metric='euclidean')
+labels = dbscan.fit_predict(distances_scaled)
+
+# Plotting results
+plt.scatter(range(len(labels)), distances_captured, c=labels, cmap='viridis')
+plt.title('DBSCAN Clustering of Distances')
+plt.xlabel('Sample Index')
+plt.ylabel('Distance')
+plt.show()
+
+
+
+
+
+
+
+
+
+
+
+
+from sklearn_extra.cluster import KMedoids
+
+# Assuming distances_captured is a precomputed distance matrix
+kmedoids = KMedoids(n_clusters=5, metric='precomputed', random_state=42)
+labels = kmedoids.fit_predict(distances_captured)
+
+# Visualization
+plt.scatter(range(len(labels)), distances_captured, c=labels, cmap='tab10')
+plt.title('K-Medoids Clustering')
+plt.xlabel('Sample Index')
+plt.ylabel('Distance')
+plt.show()
+
+
+
+
+
+
+
+
+
+
+
+from sklearn.metrics import silhouette_score, davies_bouldin_score
+
+# Silhouette Score
+silhouette_avg = silhouette_score(distances_scaled, labels)
+print(f"Silhouette Score: {silhouette_avg:.3f}")
+
+# Davies-Bouldin Score (Lower is better)
+db_score = davies_bouldin_score(distances_scaled, labels)
+print(f"Davies-Bouldin Score: {db_score:.3f}")
+
+
+
+
+
+
+
+
+
+from sklearn.manifold import TSNE
+
+tsne = TSNE(n_components=2, perplexity=30, n_iter=300)
+X_embedded = tsne.fit_transform(distances_scaled)
+
+plt.scatter(X_embedded[:, 0], X_embedded[:, 1], c=labels, cmap='viridis')
+plt.title('t-SNE Visualization of Clusters')
+plt.show()
+
