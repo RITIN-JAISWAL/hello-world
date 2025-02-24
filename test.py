@@ -390,3 +390,199 @@ for cluster_id in range(n_clusters):
     plt.title(f"Markov Chain for Cluster {cluster_id + 1}")
     plt.show()
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import gc
+import matplotlib.pyplot as plt
+
+# ============================
+# Dataset Preparation
+# ============================
+
+class MatrixDataset(Dataset):
+    def __init__(self, df, n_nodes):
+        super().__init__()
+        self.df = df
+        self.n_nodes = n_nodes
+
+    def get_adj(self, path):
+        adj = np.zeros((self.n_nodes, self.n_nodes), dtype=np.float32)
+        adj[path[0], 0] = 1  # From source
+        adj[self.n_nodes - 1, path[-1]] = 1  # To sink
+        adj[self.n_nodes - 1, self.n_nodes - 1] = 1  # Sink absorbs
+
+        for i in range(len(path) - 1):
+            adj[path[i + 1], path[i]] = 1
+
+        col_sums = adj.sum(axis=0)
+        col_sums[col_sums == 0] = 1e-6  # Avoid division by zero
+        adj /= col_sums
+
+        return np.nan_to_num(adj)
+
+    def __getitem__(self, index):
+        path = self.df.at[index, 'path']
+        adj = self.get_adj(path)
+        return torch.tensor(adj, dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.df)
+
+# ============================
+# Enhanced Model Definition
+# ============================
+
+class MatrixEmbedder(nn.Module):
+    def __init__(self, n_nodes, embed_dim):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(n_nodes ** 2, 500),
+            nn.BatchNorm1d(500),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+
+            nn.Linear(500, 250),
+            nn.BatchNorm1d(250),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+
+            nn.Linear(250, 100),
+            nn.BatchNorm1d(100),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+
+            nn.Linear(100, embed_dim)
+        )
+
+    def forward(self, x):
+        x = x.flatten(start_dim=1)
+        return self.layers(x)
+
+# ============================
+# Distance Functions
+# ============================
+
+def dme(mat1, mat2, vector):
+    mat = np.matmul(mat1.T, mat2)
+    v = np.matmul(mat, vector)
+    out = np.matmul(vector.T, v)
+    return out[0, 0]
+
+def markov_distance(mata, matb):
+    v1 = np.ones((mata.shape[0], 1))
+    out = dme(mata, matb, v1) - 0.5 * dme(mata, mata, v1) - 0.5 * dme(matb, matb, v1)
+    return out
+
+# ============================
+# Training Loop
+# ============================
+
+def train_model(mapped_journeys_df, embed_dim=20, batch_size=16, epochs=50, lr=1e-3):
+    n_nodes = mapped_journeys_df['path'].apply(max).max() + 2
+    dataset = MatrixDataset(df=mapped_journeys_df, n_nodes=n_nodes)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    embedder = MatrixEmbedder(n_nodes=n_nodes, embed_dim=embed_dim)
+    optimizer = AdamW(embedder.parameters(), lr=lr, weight_decay=1e-5)
+    scheduler = ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)
+    losses = []
+
+    for ep in range(epochs):
+        epoch_loss = 0
+        print(f"Epoch {ep + 1}/{epochs}")
+        for batch in dataloader:
+            optimizer.zero_grad()
+
+            # Calculate Markov distances
+            distances = []
+            with torch.no_grad():
+                for i in range(batch.size(0)):
+                    for j in range(i + 1, batch.size(0)):
+                        d = markov_distance(batch[i].cpu().numpy(), batch[j].cpu().numpy())
+                        distances.append(d)
+            distances = torch.tensor(distances, dtype=torch.float32)
+
+            # Embed batch and calculate loss
+            batch_flat = batch.view(batch.size(0), -1)
+            embeddings = embedder(batch_flat)
+            left_vecs = embeddings[:-1]
+            right_vecs = embeddings[1:]
+            diff = left_vecs - right_vecs
+
+            loss = torch.pow(((diff ** 2).sum(axis=1) - distances ** 2), 2).sum()
+            loss.backward()
+
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(embedder.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            epoch_loss += loss.item()
+
+            # Memory cleanup
+            del batch, left_vecs, right_vecs, diff, distances
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        epoch_loss /= len(dataloader)
+        scheduler.step(epoch_loss)
+        losses.append(epoch_loss)
+        print(f"Loss: {epoch_loss:.4f}")
+
+    print("Training completed successfully!")
+    return embedder, losses
+
+# ============================
+# Training Execution
+# ============================
+
+# Example: Assuming mapped_journeys_df is already created
+# embedder, losses = train_model(mapped_journeys_df)
+
+# ============================
+# Visualization
+# ============================
+
+def plot_losses(losses):
+    plt.plot(losses)
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training Loss Curve')
+    plt.show()
+
+# plot_losses(losses)
+
+
