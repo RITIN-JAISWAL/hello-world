@@ -603,18 +603,12 @@ def plot_losses(losses):
 
 
 
-# ============================
-# Imports
-# ============================
-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
-import pandas as pd
 import gc
 import matplotlib.pyplot as plt
 
@@ -697,52 +691,50 @@ def markov_distance(mata, matb):
     return out
 
 # ============================
-# Training Loop
+# Optimized Training Loop
 # ============================
 
-def train_model(mapped_journeys_df, embed_dim=20, batch_size=16, epochs=50, lr=1e-3):
+def train_model(mapped_journeys_df, embed_dim=20, batch_size=8, epochs=50, lr=1e-3):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     n_nodes = mapped_journeys_df['path'].apply(max).max() + 2
     dataset = MatrixDataset(df=mapped_journeys_df, n_nodes=n_nodes)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-    embedder = MatrixEmbedder(n_nodes=n_nodes, embed_dim=embed_dim)
+    embedder = MatrixEmbedder(n_nodes=n_nodes, embed_dim=embed_dim).to(device)
     optimizer = AdamW(embedder.parameters(), lr=lr, weight_decay=1e-5)
     scheduler = ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)
     losses = []
 
+    scaler = torch.cuda.amp.GradScaler()  # Mixed precision
+
     for ep in range(epochs):
         epoch_loss = 0
         print(f"Epoch {ep + 1}/{epochs}")
+
         for batch in dataloader:
+            batch = batch.to(device)
             optimizer.zero_grad()
 
-            # Calculate Markov distances
-            distances = []
-            with torch.no_grad():
-                for i in range(batch.size(0)):
-                    for j in range(i + 1, batch.size(0)):
-                        d = markov_distance(batch[i].cpu().numpy(), batch[j].cpu().numpy())
-                        distances.append(d)
-            distances = torch.tensor(distances, dtype=torch.float32)
+            with torch.cuda.amp.autocast():  # Mixed precision
+                batch_flat = batch.view(batch.size(0), -1)
+                embeddings = embedder(batch_flat)
 
-            # Embed batch and calculate loss
-            batch_flat = batch.view(batch.size(0), -1)
-            embeddings = embedder(batch_flat)
-            left_vecs = embeddings[:-1]
-            right_vecs = embeddings[1:]
-            diff = left_vecs - right_vecs
+                # Calculate distances within the batch
+                distances = torch.cdist(embeddings, embeddings, p=2)
 
-            loss = torch.pow(((diff ** 2).sum(axis=1) - distances ** 2), 2).sum()
-            loss.backward()
+                # Loss: minimize intra-batch distances
+                loss = torch.mean(distances)
 
-            # Gradient clipping
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(embedder.parameters(), max_norm=1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
 
             epoch_loss += loss.item()
 
             # Memory cleanup
-            del batch, left_vecs, right_vecs, diff, distances
+            del batch, embeddings, distances, loss
             gc.collect()
             torch.cuda.empty_cache()
 
@@ -769,41 +761,22 @@ def plot_losses(losses):
 # Example Usage
 # ============================
 
-# Sample DataFrame (Replace this with your real mapped_journeys_df)
+# Sample DataFrame
+import pandas as pd
+
 data = {
     'channel_visit_id': [1001, 1002, 1003],
     'path': [
-        [1, 2, 3, 4, 5],   # Journey 1
-        [2, 3, 5, 6, 7],   # Journey 2
-        [1, 3, 4, 6, 8]    # Journey 3
+        [1, 2, 3, 4, 5],
+        [2, 3, 5, 6, 7],
+        [1, 3, 4, 6, 8]
     ]
 }
 
 mapped_journeys_df = pd.DataFrame(data)
 
-# Run the training
-embedder, losses = train_model(mapped_journeys_df, embed_dim=20, batch_size=2, epochs=10, lr=1e-3)
+# Run training
+embedder, losses = train_model(mapped_journeys_df, embed_dim=20, batch_size=4, epochs=10, lr=1e-3)
 
-# Plot the loss curve
+# Plot the loss
 plot_losses(losses)
-
-# ============================
-# Inference Example
-# ============================
-
-# Example: New journey path
-new_path = [1, 4, 5, 7]
-n_nodes = mapped_journeys_df['path'].apply(max).max() + 2
-
-# Create adjacency matrix
-dataset = MatrixDataset(df=pd.DataFrame({'path': [new_path]}), n_nodes=n_nodes)
-adj_matrix = dataset[0].unsqueeze(0)  # Add batch dimension
-
-# Get embedding
-embedder.eval()
-with torch.no_grad():
-    embedding = embedder(adj_matrix)
-
-print("Journey Embedding:", embedding)
-
-
