@@ -855,3 +855,382 @@ labels = kmeans.fit_predict(embeddings)
 # Add labels to dataframe
 mapped_journeys_df['cluster'] = labels
 print(mapped_journeys_df.head())
+
+
+
+
+
+import matplotlib.pyplot as plt
+
+# MDS Projection
+mds = MDS(n_components=2, dissimilarity='precomputed', random_state=42)
+mds_features = mds.fit_transform(distance_matrix)
+
+# Plot clusters
+plt.figure(figsize=(10, 6))
+for cluster_id in np.unique(labels):
+    indices = labels == cluster_id
+    plt.scatter(mds_features[indices, 0], mds_features[indices, 1], label=f'Cluster {cluster_id}')
+
+plt.title("MDS Projection of DTW + K-Medoids Clusters")
+plt.xlabel("MDS Dimension 1")
+plt.ylabel("MDS Dimension 2")
+plt.legend()
+plt.show()
+
+
+
+def cluster_stats(distance_matrix, labels):
+    clusters = np.unique(labels)
+    intra_dists = []
+    inter_dists = []
+
+    # Intra-cluster distances
+    for cluster in clusters:
+        indices = np.where(labels == cluster)[0]
+        intra = np.mean([distance_matrix[i, j] for i in indices for j in indices if i != j])
+        intra_dists.append(intra)
+
+    # Inter-cluster distances
+    for i in range(len(clusters)):
+        for j in range(i + 1, len(clusters)):
+            indices_i = np.where(labels == clusters[i])[0]
+            indices_j = np.where(labels == clusters[j])[0]
+            inter = np.mean([distance_matrix[p, q] for p in indices_i for q in indices_j])
+            inter_dists.append(inter)
+
+    print(f"Average Intra-cluster Distance: {np.mean(intra_dists):.3f}")
+    print(f"Average Inter-cluster Distance: {np.mean(inter_dists):.3f}")
+
+cluster_stats(distance_matrix, labels)
+
+
+
+
+
+
+
+
+
+# ===============================
+# Step 1: Import Required Libraries
+# ===============================
+from sklearn.metrics import silhouette_score, silhouette_samples
+import matplotlib.pyplot as plt
+import numpy as np
+
+# ===============================
+# Step 2: Assume You Have:
+# ava_mapped: 2D data points (UMAP projection)
+# labels: Cluster labels assigned (e.g., from KMeans, DBSCAN, etc.)
+# ===============================
+
+# Example:
+# ava_mapped = np.array([[2, 3], [5, 6], [3, 2], [8, 7], [7, 5]])  # Replace with your data
+# labels = np.array([0, 1, 0, 1, 1])  # Replace with your cluster labels
+
+# ===============================
+# Step 3: Calculate Silhouette Score
+# ===============================
+def calculate_silhouette(ava_mapped, labels):
+    # Compute average silhouette score
+    avg_score = silhouette_score(ava_mapped, labels)
+    print(f'Average Silhouette Score: {avg_score:.3f}')
+    return avg_score
+
+# ===============================
+# Step 4: Plot Silhouette Analysis
+# ===============================
+def plot_silhouette(ava_mapped, labels):
+    n_clusters = len(np.unique(labels))
+    silhouette_vals = silhouette_samples(ava_mapped, labels)
+    avg_score = silhouette_score(ava_mapped, labels)
+    
+    y_lower = 10
+    plt.figure(figsize=(10, 6))
+
+    for i in range(n_clusters):
+        # Aggregate silhouette scores for samples in cluster i
+        ith_cluster_silhouette_vals = silhouette_vals[labels == i]
+        ith_cluster_silhouette_vals.sort()
+
+        size_cluster_i = ith_cluster_silhouette_vals.shape[0]
+        y_upper = y_lower + size_cluster_i
+
+        color = plt.cm.nipy_spectral(float(i) / n_clusters)
+        plt.fill_betweenx(np.arange(y_lower, y_upper),
+                          0, ith_cluster_silhouette_vals,
+                          facecolor=color, edgecolor=color, alpha=0.7)
+
+        plt.text(-0.05, y_lower + 0.5 * size_cluster_i, str(i))
+        y_lower = y_upper + 10  # Add space between clusters
+
+    # Plot formatting
+    plt.axvline(x=avg_score, color="red", linestyle="--", label=f'Avg Silhouette Score: {avg_score:.3f}')
+    plt.xlabel("Silhouette Coefficient Values")
+    plt.ylabel("Cluster Label")
+    plt.title("Silhouette Plot for the Clusters")
+    plt.legend(loc='best')
+    plt.show()
+
+# ===============================
+# Step 5: Run the Silhouette Evaluation
+# ===============================
+# Calculate silhouette score
+avg_score = calculate_silhouette(ava_mapped, labels)
+
+# Plot silhouette analysis
+plot_silhouette(ava_mapped, labels)
+
+
+
+
+
+
+from sklearn.metrics import silhouette_score
+from sklearn.cluster import KMeans
+import torch
+import numpy as np
+from tqdm import tqdm
+
+# ---------------------------
+# Step 1: Extract Embeddings
+# ---------------------------
+def extract_embeddings(embedder, dataloader):
+    embedder.eval()  # Set model to evaluation mode
+    all_embeddings = []
+
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Extracting Embeddings"):
+            embeddings = embedder(batch.float())
+            all_embeddings.append(embeddings.cpu().numpy())
+
+    return np.concatenate(all_embeddings, axis=0)
+
+# ---------------------------
+# Step 2: Perform Clustering
+# ---------------------------
+def perform_kmeans(embeddings, n_clusters=5):
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+    labels = kmeans.fit_predict(embeddings)
+    return labels
+
+# ---------------------------
+# Step 3: Compute Silhouette Score
+# ---------------------------
+def evaluate_clustering(embeddings, labels):
+    score = silhouette_score(embeddings, labels)
+    print(f"Silhouette Score: {score:.4f}")
+    return score
+
+# ---------------------------
+# Execute the Evaluation
+# ---------------------------
+# Assuming 'embedder' is trained and 'dataloader' is ready
+embeddings = extract_embeddings(embedder, dataloader)
+
+# Try different cluster numbers
+best_score = -1
+best_k = None
+
+for n_clusters in range(2, 11):
+    print(f"\nEvaluating for n_clusters = {n_clusters}")
+    labels = perform_kmeans(embeddings, n_clusters=n_clusters)
+    score = evaluate_clustering(embeddings, labels)
+    
+    if score > best_score:
+        best_score = score
+        best_k = n_clusters
+
+print(f"\nBest Silhouette Score: {best_score:.4f} with n_clusters = {best_k}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from torch.optim import Adam
+from sklearn.metrics import silhouette_score
+import matplotlib.pyplot as plt
+import gc
+
+# ----------------------
+# 1. Dataset Preparation
+# ----------------------
+class MatrixDataset(Dataset):
+    def __init__(self, paths, n_nodes):
+        self.paths = paths
+        self.n_nodes = n_nodes
+
+    def get_adj(self, path):
+        adj = np.zeros((self.n_nodes, self.n_nodes), dtype=np.float32)
+        for i in range(len(path) - 1):
+            adj[path[i], path[i+1]] += 1
+        col_sums = adj.sum(axis=0)
+        col_sums[col_sums == 0] = 1e-6  # Avoid division by zero
+        adj = adj / col_sums
+        adj = np.nan_to_num(adj)
+        return adj
+
+    def __getitem__(self, idx):
+        path = self.paths[idx]
+        adj = self.get_adj(path)
+        return torch.tensor(adj, dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.paths)
+
+# ----------------------
+# 2. Neural Network Embedder
+# ----------------------
+class MatrixEmbedder(nn.Module):
+    def __init__(self, n_nodes, embed_dim):
+        super(MatrixEmbedder, self).__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(n_nodes * n_nodes, 500),
+            nn.Tanh(),
+            nn.Linear(500, 250),
+            nn.Tanh(),
+            nn.Linear(250, 100),
+            nn.Tanh(),
+            nn.Linear(100, 50),
+            nn.Tanh(),
+            nn.Linear(50, embed_dim)
+        )
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        return self.layers(x)
+
+# ----------------------
+# 3. Distance Functions
+# ----------------------
+def dme(mat1, mat2, vector):
+    mat = np.matmul(mat1.T, mat2)
+    v = np.matmul(mat, vector)
+    out = np.matmul(vector.T, v)
+    return out[0, 0]
+
+def markov_distance(mata, matb):
+    v1 = np.ones((mata.shape[0], 1))
+    return dme(mata, matb, v1) - 0.5 * dme(mata, mata, v1) - 0.5 * dme(matb, matb, v1)
+
+# ----------------------
+# 4. Data Generation
+# ----------------------
+# Example data: list of paths
+np.random.seed(42)
+n_samples = 100
+n_nodes = 10
+paths = [np.random.choice(n_nodes, size=np.random.randint(5, 10), replace=False).tolist() for _ in range(n_samples)]
+
+dataset = MatrixDataset(paths, n_nodes)
+dataloader = DataLoader(dataset, batch_size=16, shuffle=True)
+
+# ----------------------
+# 5. Training Setup
+# ----------------------
+embed_dim = 20
+embedder = MatrixEmbedder(n_nodes, embed_dim)
+optim = Adam(embedder.parameters(), lr=0.001)
+epochs = 50
+losses = []
+
+# ----------------------
+# 6. Training Loop
+# ----------------------
+for ep in range(epochs):
+    total_loss = 0
+    for batch in dataloader:
+        optim.zero_grad()
+        
+        # Pairwise distances
+        batch_size = batch.size(0)
+        left_indices = np.random.randint(0, batch_size, size=batch_size)
+        right_indices = np.random.randint(0, batch_size, size=batch_size)
+        
+        left_batch = batch[left_indices]
+        right_batch = batch[right_indices]
+        
+        # Forward pass
+        left_vecs = embedder(left_batch)
+        right_vecs = embedder(right_batch)
+        
+        # Compute pairwise distances
+        diff = left_vecs - right_vecs
+        distances = torch.norm(diff, dim=1)
+        
+        # Loss (Contrastive)
+        loss = torch.mean(distances)
+        loss.backward()
+        optim.step()
+        
+        total_loss += loss.item()
+    
+    losses.append(total_loss / len(dataloader))
+    print(f"Epoch {ep+1}/{epochs}, Loss: {total_loss / len(dataloader):.4f}")
+
+# ----------------------
+# 7. Loss Plot
+# ----------------------
+plt.plot(losses)
+plt.xlabel("Epochs")
+plt.ylabel("Loss")
+plt.title("Training Loss Over Epochs")
+plt.show()
+
+# ----------------------
+# 8. Clustering and Silhouette Score
+# ----------------------
+# Generate embeddings for all data
+all_vecs = []
+with torch.no_grad():
+    for batch in dataloader:
+        embeddings = embedder(batch)
+        all_vecs.append(embeddings)
+
+all_vecs = torch.cat(all_vecs).numpy()
+
+# KMeans Clustering
+from sklearn.cluster import KMeans
+kmeans = KMeans(n_clusters=5, random_state=42)
+labels = kmeans.fit_predict(all_vecs)
+
+# Silhouette Score
+score = silhouette_score(all_vecs, labels)
+print(f"Silhouette Score: {score:.4f}")
+
+# ----------------------
+# 9. Visualization (t-SNE)
+# ----------------------
+from sklearn.manifold import TSNE
+
+tsne = TSNE(n_components=2, random_state=42)
+all_vecs_2d = tsne.fit_transform(all_vecs)
+
+plt.figure(figsize=(8,6))
+plt.scatter(all_vecs_2d[:,0], all_vecs_2d[:,1], c=labels, cmap='viridis', s=50)
+plt.title("t-SNE Visualization of Path Embeddings")
+plt.colorbar()
+plt.show()
