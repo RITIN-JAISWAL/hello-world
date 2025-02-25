@@ -801,78 +801,29 @@ plot_losses(losses)
 
 
 
-from scipy.cluster.hierarchy import linkage, dendrogram, fcluster
-import matplotlib.pyplot as plt
-
-# Assuming distances_captured is a condensed distance matrix
-Z = linkage(distances_captured, method='ward')  # 'ward' works well for Euclidean distances
-
-# Plot Dendrogram
-plt.figure(figsize=(10, 7))
-dendrogram(Z, truncate_mode='lastp', p=30, leaf_rotation=90., leaf_font_size=12.)
-plt.title('Hierarchical Clustering Dendrogram')
-plt.xlabel('Sample Index')
-plt.ylabel('Distance')
-plt.show()
-
-# Cut the dendrogram to form clusters
-from scipy.cluster.hierarchy import fcluster
-clusters = fcluster(Z, t=5, criterion='maxclust')  # t=5 defines the number of clusters
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-from sklearn.cluster import DBSCAN
-from sklearn.preprocessing import StandardScaler
-
-# Normalize distances
-scaler = StandardScaler()
-distances_scaled = scaler.fit_transform(distances_captured.reshape(-1, 1))
-
-# DBSCAN
-dbscan = DBSCAN(eps=0.5, min_samples=5, metric='euclidean')
-labels = dbscan.fit_predict(distances_scaled)
-
-# Plotting results
-plt.scatter(range(len(labels)), distances_captured, c=labels, cmap='viridis')
-plt.title('DBSCAN Clustering of Distances')
-plt.xlabel('Sample Index')
-plt.ylabel('Distance')
-plt.show()
-
-
-
-
-
-
-
-
-
-
-
-
+from dtaidistance import dtw
 from sklearn_extra.cluster import KMedoids
+import numpy as np
 
-# Assuming distances_captured is a precomputed distance matrix
+# Step 1: Prepare sequences
+sequences = mapped_journeys_df['path'].tolist()
+
+# Step 2: Compute pairwise DTW distances
+distance_matrix = np.zeros((len(sequences), len(sequences)))
+
+for i in range(len(sequences)):
+    for j in range(i+1, len(sequences)):
+        distance = dtw.distance(sequences[i], sequences[j])
+        distance_matrix[i, j] = distance
+        distance_matrix[j, i] = distance
+
+# Step 3: Apply K-Medoids clustering
 kmedoids = KMedoids(n_clusters=5, metric='precomputed', random_state=42)
-labels = kmedoids.fit_predict(distances_captured)
+labels = kmedoids.fit_predict(distance_matrix)
 
-# Visualization
-plt.scatter(range(len(labels)), distances_captured, c=labels, cmap='tab10')
-plt.title('K-Medoids Clustering')
-plt.xlabel('Sample Index')
-plt.ylabel('Distance')
-plt.show()
+# Add labels to dataframe
+mapped_journeys_df['cluster'] = labels
+print(mapped_journeys_df.head())
 
 
 
@@ -880,34 +831,27 @@ plt.show()
 
 
 
+from karateclub import Graph2Vec
+from sklearn.cluster import KMeans
+import networkx as nx
 
+# Step 1: Convert paths to graphs
+graphs = []
+for path in mapped_journeys_df['path']:
+    G = nx.DiGraph()
+    for i in range(len(path) - 1):
+        G.add_edge(path[i], path[i+1])
+    graphs.append(G)
 
+# Step 2: Graph2Vec Embedding
+model = Graph2Vec(dimensions=128)
+model.fit(graphs)
+embeddings = model.get_embedding()
 
+# Step 3: KMeans Clustering
+kmeans = KMeans(n_clusters=5, random_state=42)
+labels = kmeans.fit_predict(embeddings)
 
-from sklearn.metrics import silhouette_score, davies_bouldin_score
-
-# Silhouette Score
-silhouette_avg = silhouette_score(distances_scaled, labels)
-print(f"Silhouette Score: {silhouette_avg:.3f}")
-
-# Davies-Bouldin Score (Lower is better)
-db_score = davies_bouldin_score(distances_scaled, labels)
-print(f"Davies-Bouldin Score: {db_score:.3f}")
-
-
-
-
-
-
-
-
-
-from sklearn.manifold import TSNE
-
-tsne = TSNE(n_components=2, perplexity=30, n_iter=300)
-X_embedded = tsne.fit_transform(distances_scaled)
-
-plt.scatter(X_embedded[:, 0], X_embedded[:, 1], c=labels, cmap='viridis')
-plt.title('t-SNE Visualization of Clusters')
-plt.show()
-
+# Add labels to dataframe
+mapped_journeys_df['cluster'] = labels
+print(mapped_journeys_df.head())
