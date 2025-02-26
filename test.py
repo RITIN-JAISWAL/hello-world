@@ -2060,3 +2060,231 @@ unique_clusters = np.unique(labels)
 for cluster in unique_clusters:
     plot_cluster_paths(df234, labels, cluster)
 
+
+
+
+
+
+
+
+
+import pandas as pd
+import numpy as np
+import networkx as nx
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import umap
+from tqdm import tqdm
+from torch.utils.data import Dataset, DataLoader
+from sklearn_extra.cluster import KMedoids
+from sklearn.metrics import silhouette_score
+from dtaidistance import dtw
+import matplotlib.pyplot as plt
+import pickle
+
+# ================================
+# Step 1: Preprocess Data
+# ================================
+
+# Function to map pages to numbers and retain both versions
+def map_pages_to_numbers(df, path_column='path'):
+    """
+    Maps unique page names to numerical IDs while retaining the original names.
+
+    :param df: DataFrame containing journeys
+    :param path_column: Column containing ordered paths
+    :return: DataFrame with both mapped numbers and actual page names
+    """
+    unique_pages = pd.Series([page for path in df[path_column] for page in path]).unique()
+
+    # Create a page-to-number mapping
+    page_to_number = {page: idx + 1 for idx, page in enumerate(unique_pages)}
+    number_to_page = {v: k for k, v in page_to_number.items()}  # Reverse mapping
+
+    # Map each journey to numbers
+    df['path_numeric'] = df[path_column].apply(lambda path: [page_to_number[page] for page in path])
+
+    return df, page_to_number, number_to_page
+
+# Sample Data (Modify this with actual data)
+data = {
+    'channel_visit_id': [111, 112, 113, 114],
+    'path': [
+        ['home', 'login', 'dashboard', 'settings'],
+        ['home', 'products', 'cart', 'checkout'],
+        ['home', 'about', 'contact'],
+        ['login', 'dashboard', 'logout']
+    ]
+}
+
+# Create DataFrame
+journey_paths_df = pd.DataFrame(data)
+
+# Apply the function
+mapped_journeys_df, page_to_number, number_to_page = map_pages_to_numbers(journey_paths_df)
+
+# Save df234 (Numerical representation for clustering)
+df234 = mapped_journeys_df[['channel_visit_id', 'path_numeric']].rename(columns={'path_numeric': 'path'})
+df234_page_mapping = number_to_page  # Mapping numbers back to original pages
+
+# ================================
+# Step 2: Define Dataset Class
+# ================================
+
+class MatrixDataset(Dataset):
+    def __init__(self, df, n_nodes):
+        self.df = df
+        self.n_nodes = n_nodes
+
+    def get_adj(self, path):
+        """
+        Converts a given path into an adjacency matrix representation.
+        """
+        adj = np.zeros((self.n_nodes, self.n_nodes), dtype=np.float32)
+
+        # Source node
+        adj[path[0], 0] = 1
+        # Destination node
+        adj[self.n_nodes - 1, path[-1]] = 1
+        adj[self.n_nodes - 1, self.n_nodes - 1] = 1  # Sink node absorbs
+
+        # Fill adjacency matrix along the path
+        for i in range(len(path) - 1):
+            adj[path[i + 1], path[i]] = 1
+
+        col_sums = adj.sum(axis=0)
+        col_sums[col_sums == 0] = 1e-6  # Avoid division by zero
+        adj = adj / col_sums
+
+        return adj
+
+    def __getitem__(self, index):
+        path = self.df.iloc[index]['path']
+        adj = self.get_adj(path)
+        return torch.tensor(adj, dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.df)
+
+# Compute n_nodes dynamically
+n_nodes = max([max(path) for path in df234['path']]) + 2  # Adding 2 for source and sink
+
+# Initialize dataset and dataloader
+dataset = MatrixDataset(df234, n_nodes=n_nodes)
+
+# ================================
+# Step 3: Define Model
+# ================================
+
+class MatrixEmbedder(nn.Module):
+    def __init__(self, n_nodes, embed_dim):
+        super().__init__()
+        self.layer1 = nn.Linear(n_nodes ** 2, 500, bias=True)
+        self.layer2 = nn.Linear(500, 250, bias=True)
+        self.layer3 = nn.Linear(250, 100, bias=True)
+        self.layer4 = nn.Linear(100, 50, bias=True)
+        self.layer5 = nn.Linear(50, embed_dim, bias=True)
+
+    def forward(self, x):
+        x = x.flatten(start_dim=1, end_dim=-1)
+        x = torch.tanh(self.layer1(x))
+        x = torch.tanh(self.layer2(x))
+        x = torch.tanh(self.layer3(x))
+        x = torch.tanh(self.layer4(x))
+        x = torch.tanh(self.layer5(x))
+        return x
+
+embed_dim = 20
+embedder = MatrixEmbedder(n_nodes=n_nodes, embed_dim=embed_dim)
+optimizer = optim.Adam(embedder.parameters(), lr=0.001)
+
+# ================================
+# Step 4: Train Model
+# ================================
+
+def train_model(dataset, embedder, optimizer, epochs=100, batch_size=16):
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    losses = []
+
+    for ep in range(epochs):
+        print(f"Epoch {ep+1}/{epochs}")
+        for batch in dataloader:
+            optimizer.zero_grad()
+
+            embeddings = embedder(batch)
+            loss = (embeddings ** 2).sum()
+            loss.backward()
+            optimizer.step()
+
+            losses.append(loss.item())
+
+        print(f"Loss: {loss.item()}")
+
+    return losses
+
+losses = train_model(dataset, embedder, optimizer)
+
+# ================================
+# Step 5: Embedding & Clustering
+# ================================
+
+# Convert dataset to embeddings
+all_vecs = []
+for batch in tqdm(DataLoader(dataset, batch_size=16), total=len(dataset) // 16):
+    vecs = embedder(batch.to(torch.float32))
+    all_vecs.append(vecs.detach().numpy())
+
+all_vecs_array = np.concatenate(all_vecs, axis=0)
+
+# Save & Load Embeddings
+with open("all_vecs_array.pkl", "wb") as f:
+    pickle.dump(all_vecs_array, f)
+
+with open("all_vecs_array.pkl", "rb") as f:
+    all_vecs_array = pickle.load(f)
+
+# UMAP Reduction
+mapper = umap.UMAP()
+ava_mapped = mapper.fit_transform(all_vecs_array)
+
+# K-Medoids Clustering
+distance_matrix = np.zeros((len(ava_mapped), len(ava_mapped)))
+for i in range(len(ava_mapped)):
+    for j in range(i + 1, len(ava_mapped)):
+        distance = dtw.distance(ava_mapped[i], ava_mapped[j])
+        distance_matrix[i, j] = distance
+        distance_matrix[j, i] = distance
+
+kmedoids = KMedoids(n_clusters=5, metric='precomputed', random_state=42)
+labels = kmedoids.fit_predict(distance_matrix)
+
+# Evaluate Clustering
+silhouette_avg = silhouette_score(distance_matrix, labels, metric="precomputed")
+print(f"Silhouette Score: {silhouette_avg}")
+
+# ================================
+# Step 6: Plot Journey Paths per Cluster
+# ================================
+
+def plot_cluster_paths_with_names(df, labels, cluster_id, number_to_page):
+    G = nx.DiGraph()
+    cluster_paths = df[labels == cluster_id]['path'].tolist()
+
+    edge_weights = {}
+
+    for path in cluster_paths:
+        for i in range(len(path) - 1):
+            edge = (number_to_page[path[i]], number_to_page[path[i+1]])  
+            edge_weights[edge] = edge_weights.get(edge, 0) + 1
+
+    for edge, weight in edge_weights.items():
+        G.add_edge(edge[0], edge[1], weight=weight)
+
+    pos = nx.spring_layout(G, seed=42)
+    plt.figure(figsize=(12, 8))
+    nx.draw(G, pos, with_labels=True, node_color='lightblue', edge_color='blue', width=[d['weight']*0.2 for u,v,d in G.edges(data=True)])
+    plt.title(f"Cluster {cluster_id} Journey Paths")
+    plt.show()
+
+plot_cluster_paths_with_names(df234, labels, cluster_id=0, number_to_page=number_to_page)
