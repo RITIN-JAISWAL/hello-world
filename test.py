@@ -1985,3 +1985,78 @@ print(f"Silhouette Score: {silhouette_avg}")
 plt.scatter(ava_mapped[:, 0], ava_mapped[:, 1], c=labels, cmap='viridis', alpha=0.7)
 plt.title("Clustered Data")
 plt.show()
+
+
+
+
+
+
+
+
+
+import networkx as nx
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+# ===========================================
+# Step 1: Define Function to Plot Paths for Each Cluster
+# ===========================================
+def plot_cluster_paths(df, labels, cluster_id):
+    """
+    Visualizes the user journey for a given cluster using NetworkX.
+
+    :param df: DataFrame containing paths
+    :param labels: Cluster labels assigned to each journey
+    :param cluster_id: The cluster ID to visualize
+    """
+    G = nx.DiGraph()
+    cluster_paths = df[labels == cluster_id]['path'].tolist()
+
+    edge_weights = {}
+
+    # Extract edges and count occurrences (to use as weights)
+    for path in cluster_paths:
+        for i in range(len(path) - 1):
+            edge = (path[i], path[i+1])
+            if edge in edge_weights:
+                edge_weights[edge] += 1
+            else:
+                edge_weights[edge] = 1
+
+    # Add edges with weights
+    for edge, weight in edge_weights.items():
+        G.add_edge(edge[0], edge[1], weight=weight)
+
+    # Positioning nodes using spring layout
+    pos = nx.spring_layout(G, seed=42)
+
+    # Drawing the graph
+    plt.figure(figsize=(10, 7))
+    edges = G.edges(data=True)
+
+    nx.draw_networkx_nodes(G, pos, node_size=1000, node_color="skyblue", edgecolors="black")
+    nx.draw_networkx_edges(G, pos, edgelist=[(u, v) for u, v, d in edges], width=[d['weight'] * 0.2 for u, v, d in edges], alpha=0.7, edge_color="blue", arrows=True)
+    nx.draw_networkx_labels(G, pos, font_size=10, font_weight="bold")
+
+    # Add edge labels (weights)
+    edge_labels = {(u, v): d['weight'] for u, v, d in edges}
+    nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=8, label_pos=0.5)
+
+    plt.title(f"Journey Visualization for Cluster {cluster_id}")
+    plt.show()
+
+# ===========================================
+# Step 2: Load the Data (df234) and Cluster Labels
+# ===========================================
+# Sample Data (Replace this with actual clustered data)
+df234 = pd.DataFrame({'path': [[1, 2, 3, 4], [2, 3, 5], [1, 4, 6], [3, 5, 7, 8], [2, 6, 7, 9, 10], [1, 3, 6, 9]]})
+labels = np.array([0, 1, 0, 1, 2, 2])  # Sample cluster labels (Replace with actual clustering output)
+
+# ===========================================
+# Step 3: Visualize Each Cluster
+# ===========================================
+unique_clusters = np.unique(labels)
+for cluster in unique_clusters:
+    plot_cluster_paths(df234, labels, cluster)
+
