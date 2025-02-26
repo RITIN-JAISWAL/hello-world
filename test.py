@@ -2337,3 +2337,64 @@ def plot_cluster_paths_with_names(df, labels, cluster_id, number_to_page):
     plt.title(f"Cluster {cluster_id} Journey Paths")
     plt.show()
 plot_cluster_paths_with_names(df234, labels, cluster_id=3, number_to_page=page_mapping)
+
+
+
+
+
+
+import networkx as nx
+import matplotlib.pyplot as plt
+from collections import Counter
+
+def plot_cluster_paths_with_names(df, labels, cluster_id, number_to_page):
+    """
+    Plots user journey paths for a specific cluster using actual page names and transition frequencies.
+
+    :param df: DataFrame containing the journey paths.
+    :param labels: Cluster labels assigned to each journey.
+    :param cluster_id: The cluster to visualize.
+    :param number_to_page: Dictionary mapping numerical page IDs back to page names.
+    """
+
+    # Reverse mapping from numbers to actual page names
+    rev_page_mapping = {v: k for k, v in number_to_page.items()}
+
+    # Extract paths for the specified cluster
+    cluster_indices = [i for i, label in enumerate(labels) if label == cluster_id]
+    paths_in_group = df.iloc[cluster_indices]['path'].tolist()
+
+    # Convert numerical paths to actual page names
+    transitions_filtered = []
+    for nodes in paths_in_group:
+        nodes_reversed = [rev_page_mapping[n] for n in nodes]  # Convert to page names
+        transitions_filtered.extend(list(zip(nodes_reversed, nodes_reversed[1:])))  # Create transitions
+
+    # Count transition frequencies
+    transition_counts = Counter(transitions_filtered)
+
+    # Create a directed graph
+    G = nx.DiGraph()
+
+    # Add edges based on transition frequency
+    for (src, dst), freq in transition_counts.items():
+        G.add_edge(src, dst, weight=freq)
+
+    # Draw the graph
+    plt.figure(figsize=(14, 10))
+    pos = nx.spring_layout(G, k=0.5)  # Layout for better visualization
+
+    # Extract edge weights (frequencies)
+    edge_weights = [G[u][v]['weight'] for u, v in G.edges()]
+    
+    # Draw the nodes and edges
+    nx.draw(G, pos, with_labels=True, node_color="#009BA5", edge_color="#666", width=[w / 3 for w in edge_weights], 
+            node_size=2000, arrows=True, alpha=0.8)
+
+    # Add frequency labels on edges
+    edge_labels = {(u, v): f"{G[u][v]['weight']}" for u, v in G.edges()}
+    nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=10, font_color="red")
+
+    # Show plot
+    plt.title(f"Cluster {cluster_id} Journey Paths with Transition Frequencies")
+    plt.show()
