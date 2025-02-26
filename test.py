@@ -2288,3 +2288,52 @@ def plot_cluster_paths_with_names(df, labels, cluster_id, number_to_page):
     plt.show()
 
 plot_cluster_paths_with_names(df234, labels, cluster_id=0, number_to_page=number_to_page)
+
+
+
+
+
+
+
+
+import networkx as nx
+import matplotlib.pyplot as plt
+
+def plot_cluster_paths_with_names(df, labels, cluster_id, number_to_page):
+    """
+    Plots user journey paths for a specific cluster using actual page names.
+
+    :param df: DataFrame containing the journey paths.
+    :param labels: Cluster labels assigned to each journey.
+    :param cluster_id: The cluster to visualize.
+    :param number_to_page: Dictionary mapping numerical page IDs back to page names.
+    """
+
+    # Reverse mapping from numbers to page names
+    rev_page_mapping = {v: k for k, v in number_to_page.items()}
+
+    # Extract paths for the specified cluster
+    cluster_indices = [i for i, label in enumerate(labels) if label == cluster_id]
+    paths_in_group = df.iloc[cluster_indices]['path'].tolist()
+
+    # Convert numerical paths to actual page names
+    transitions_filtered = []
+    for nodes in paths_in_group:
+        nodes_reversed = [rev_page_mapping[n] for n in nodes]  # Convert to page names
+        transitions_filtered.extend(list(zip(nodes_reversed, nodes_reversed[1:])))  # Create edges
+
+    # Create a directed graph
+    G = nx.DiGraph()
+    
+    # Add edges based on transitions
+    G.add_edges_from(transitions_filtered)
+
+    # Draw the graph
+    plt.figure(figsize=(14, 10))
+    pos = nx.spring_layout(G, k=0.5)  # Layout for better visualization
+    nx.draw(G, pos, with_labels=True, node_color="#009BA5", edge_color="#666", width=1.5, node_size=2000, arrows=True)
+    
+    # Show plot
+    plt.title(f"Cluster {cluster_id} Journey Paths")
+    plt.show()
+plot_cluster_paths_with_names(df234, labels, cluster_id=3, number_to_page=page_mapping)
