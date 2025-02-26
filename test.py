@@ -1555,3 +1555,223 @@ plt.show()
 
 
 pip install torch numpy pandas scikit-learn umap-learn dtaidistance tqdm
+
+
+
+
+
+
+
+# ==========================
+# Import Libraries
+# ==========================
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import pandas as pd
+from torch.utils.data import Dataset, DataLoader
+from sklearn_extra.cluster import KMedoids
+from sklearn.metrics import silhouette_score
+from dtaidistance import dtw
+import umap
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import pickle
+
+# ==========================
+# Step 1: Define the Dataset Class
+# ==========================
+class MatrixDataset(Dataset):
+    def __init__(self, df, n_nodes):
+        self.df = df
+        self.n_nodes = n_nodes
+
+    def get_adj(self, path):
+        adj = np.zeros((self.n_nodes, self.n_nodes), dtype=np.float32)
+
+        # Source node
+        adj[path[0], 0] = 1
+        # Destination node
+        adj[self.n_nodes - 1, path[-1]] = 1
+        adj[self.n_nodes - 1, self.n_nodes - 1] = 1  # Sink node absorbs
+
+        # Fill adjacency matrix along the path
+        for i in range(len(path) - 1):
+            adj[path[i + 1], path[i]] = 1
+
+        # Normalize adjacency matrix
+        col_sums = adj.sum(axis=0)
+        col_sums[col_sums == 0] = 1e-6  # Avoid division by zero
+        adj = adj / col_sums
+
+        return adj
+
+    def __getitem__(self, index):
+        path = self.df.iloc[index]['path']
+        adj = self.get_adj(path)
+        return torch.tensor(adj, dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.df)
+
+# ==========================
+# Step 2: Define the Model
+# ==========================
+class MatrixEmbedder(nn.Module):
+    def __init__(self, n_nodes, embed_dim):
+        super().__init__()
+        self.layer1 = nn.Sequential(nn.Linear(n_nodes ** 2, 500), nn.LeakyReLU())
+        self.layer2 = nn.Sequential(nn.Linear(500, 250), nn.LeakyReLU())
+        self.layer3 = nn.Sequential(nn.Linear(250, 100), nn.LeakyReLU())
+        self.layer4 = nn.Sequential(nn.Linear(100, 50), nn.LeakyReLU())
+        self.layer5 = nn.Linear(50, embed_dim)
+
+    def forward(self, x):
+        x = x.flatten(start_dim=1, end_dim=-1)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        x = self.layer5(x)
+        return x
+
+# ==========================
+# Step 3: Distance Calculation (Markov-based)
+# ==========================
+def dme(mat1, mat2, vector):
+    mat = np.matmul(mat1.T, mat2)
+    v = np.matmul(mat, vector)
+    out = np.matmul(vector.T, v)
+    return out[0, 0]
+
+def markov_distance(mata, matb):
+    v1 = np.ones((mata.shape[0], 1))
+    out = dme(mata, matb, v1) - 0.5 * dme(mata, mata, v1) - 0.5 * dme(matb, matb, v1)
+    return out
+
+# ==========================
+# Step 4: Training Loop
+# ==========================
+def train_model(dataset, embedder, optimizer, scheduler, epochs, batch_size):
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    losses = []
+    distances_captured = []
+
+    for ep in range(epochs):
+        print(f"Epoch {ep+1}/{epochs}")
+        for ib, batch in enumerate(dataloader):
+            optimizer.zero_grad()
+
+            # Generate pairs
+            n_per_example = 2
+            right = np.random.randint(0, batch.shape[0], n_per_example * batch.shape[0])
+            left = np.repeat(np.arange(0, batch.shape[0]), n_per_example)
+            index_pairs = np.stack([left, right]).T
+
+            # Compute distances
+            distances = []
+            with torch.no_grad():
+                for (l, r) in index_pairs:
+                    d = markov_distance(batch[l].cpu().numpy(), batch[r].cpu().numpy())
+                    distances.append(d)
+                    distances_captured.append(d)
+
+            distances = torch.tensor(distances, dtype=torch.float32)
+            distances = (distances - distances.mean()) / (distances.std() + 1e-6)  # Normalize
+
+            # Embeddings
+            left_vecs = embedder(batch[left])
+            right_vecs = embedder(batch[right])
+            diff = left_vecs - right_vecs
+
+            # Compute Loss
+            diff_norm = torch.nn.functional.normalize(diff, p=2, dim=1)
+            loss = torch.pow(((diff_norm ** 2).sum(axis=1) - distances ** 2), 2).mean()
+
+            # Backpropagation
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(embedder.parameters(), max_norm=5.0)  # Gradient Clipping
+            optimizer.step()
+            scheduler.step(loss)  # Learning Rate Scheduler
+
+            losses.append(loss.item())
+
+        print(f"Epoch {ep+1}/{epochs}, Loss: {loss.item()}")
+    return losses, distances_captured
+
+# ==========================
+# Step 5: Load Data (df234)
+# ==========================
+data = {
+    'path': [[1, 2, 3, 4], [2, 3, 5], [1, 4, 6], [3, 5, 7, 8], [1, 3, 6, 9], [4, 5, 8], [2, 4, 7], [5, 6, 9]]
+}
+df234 = pd.DataFrame(data)
+
+n_nodes = max([max(path) for path in df234['path']]) + 2  # Adding 2 for source and sink
+dataset = MatrixDataset(df234, n_nodes=n_nodes)
+
+# ==========================
+# Step 6: Train the Model
+# ==========================
+embed_dim = 20
+embedder = MatrixEmbedder(n_nodes=n_nodes, embed_dim=embed_dim)
+optimizer = optim.Adam(embedder.parameters(), lr=0.0003, weight_decay=1e-5)  # Lower LR and Regularization
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+
+epochs = 100
+batch_size = 16  # Fixed batch size as requested
+losses, distances_captured = train_model(dataset, embedder, optimizer, scheduler, epochs, batch_size)
+
+# ==========================
+# Step 7: Plot Smoothed Loss
+# ==========================
+window_size = 50
+moving_avg = np.convolve(losses, np.ones(window_size)/window_size, mode='valid')
+
+plt.plot(moving_avg)
+plt.title("Smoothed Loss Over Epochs")
+plt.xlabel("Iterations")
+plt.ylabel("Loss")
+plt.show()
+
+# ==========================
+# Step 8: Embedding & Clustering
+# ==========================
+all_vecs = []
+for ib, batch in tqdm(enumerate(DataLoader(dataset, batch_size=batch_size)), total=len(dataset) // batch_size):
+    vecs = embedder(batch.to(torch.float32))
+    all_vecs.append(vecs.detach().numpy())
+
+all_vecs_array = np.concatenate(all_vecs, axis=0)
+
+# Save & Load Embeddings
+with open("all_vecs_array.pkl", "wb") as f:
+    pickle.dump(all_vecs_array, f)
+
+with open("all_vecs_array.pkl", "rb") as f:
+    all_vecs_array = pickle.load(f)
+
+# UMAP Reduction
+mapper = umap.UMAP()
+ava_mapped = mapper.fit_transform(all_vecs_array)
+
+# K-Medoids Clustering
+distance_matrix = np.zeros((len(ava_mapped), len(ava_mapped)))
+for i in range(len(ava_mapped)):
+    for j in range(i + 1, len(ava_mapped)):
+        distance = dtw.distance(ava_mapped[i], ava_mapped[j])
+        distance_matrix[i, j] = distance
+        distance_matrix[j, i] = distance
+
+kmedoids = KMedoids(n_clusters=5, metric='precomputed', random_state=42)
+labels = kmedoids.fit_predict(distance_matrix)
+
+# Silhouette Score Evaluation
+silhouette_avg = silhouette_score(distance_matrix, labels, metric="precomputed")
+print(f"Silhouette Score: {silhouette_avg}")
+
+# ==========================
+# Step 9: Visualization
+# ==========================
+plt.scatter(ava_mapped[:, 0], ava_mapped[:, 1], c=labels, cmap='viridis
