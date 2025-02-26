@@ -2479,3 +2479,39 @@ def plot_cluster_paths_with_names(df, labels, cluster_id, number_to_page, dark_m
     # Show plot
     plt.title(f"Cluster {cluster_id} Journey Paths with Transition Frequencies", fontsize=14, fontweight="bold")
     plt.show()
+
+
+
+from collections import defaultdict
+
+def find_common_paths(df, labels):
+    """
+    Finds common paths (transitions) that appear in all clusters.
+
+    :param df: DataFrame containing journey paths.
+    :param labels: Cluster labels assigned to each journey.
+    :return: Set of transitions common to all clusters.
+    """
+    cluster_paths = defaultdict(set)
+
+    # Iterate over each journey and store transitions per cluster
+    for i, row in df.iterrows():
+        cluster_id = labels[i]  # Get the cluster label
+        path = row['path']
+
+        # Convert path into transitions (pairs of steps)
+        transitions = set(zip(path, path[1:]))  # Example: (A→B, B→C)
+        cluster_paths[cluster_id].update(transitions)
+
+    # Find common transitions across all clusters
+    common_transitions = set.intersection(*cluster_paths.values())
+    
+    return common_transitions
+
+# Get common paths across clusters
+common_paths = find_common_paths(df234, labels)
+
+# Display results
+print("Common Transitions Across All Clusters:")
+for src, dst in common_paths:
+    print(f"{src} → {dst}")
