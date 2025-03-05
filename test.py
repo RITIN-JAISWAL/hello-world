@@ -388,3 +388,181 @@ plt.ylabel('UMAP Dimension 2')
 plt.colorbar(label='Cluster Label')
 plt.show()
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Install required libraries if not installed
+!pip install networkx node2vec umap-learn scikit-learn matplotlib kneed tqdm
+
+# Import libraries
+import pandas as pd
+import numpy as np
+import networkx as nx
+from node2vec import Node2Vec
+import umap
+from sklearn.cluster import DBSCAN
+from sklearn.metrics import silhouette_score, silhouette_samples, davies_bouldin_score
+from sklearn.neighbors import NearestNeighbors
+from kneed import KneeLocator
+import matplotlib.pyplot as plt
+import collections
+from tqdm import tqdm
+import joblib
+import os
+
+# Create a directory to save models
+os.makedirs("saved_models", exist_ok=True)
+
+# 📌 Step 1: Load the dataset
+df = pd.read_csv("large_dataset.csv")  # Update with actual file path
+df["path"] = df["path"].apply(eval)  # Convert string lists to actual lists
+
+# 📌 Step 2: Construct a Directed Graph
+G = nx.DiGraph()
+
+for path in tqdm(df["path"], desc="Building Graph"):
+    edges = [(path[i], path[i+1]) for i in range(len(path)-1)]
+    G.add_edges_from(edges)
+
+# 📌 Step 3: Apply Node2Vec for Node Embeddings
+node2vec = Node2Vec(G, dimensions=128, walk_length=40, num_walks=100, workers=8, p=1, q=1)
+model = node2vec.fit(window=10, min_count=1, batch_words=4)
+
+# Save the Node2Vec model
+model.save("saved_models/node2vec.model")
+
+# Get node embeddings
+node_ids = list(model.wv.index_to_key)
+node_embeddings = np.array([model.wv[node] for node in node_ids])
+
+# 📌 Step 4: Apply UMAP for **3D** Dimensionality Reduction
+umap_model = umap.UMAP(n_neighbors=30, min_dist=0.1, n_components=3, random_state=42, metric="cosine", verbose=True)
+umap_embeddings = umap_model.fit_transform(node_embeddings)
+
+# Save the UMAP model
+joblib.dump(umap_model, "saved_models/umap_model.pkl")
+
+# 📌 Step 5: Find Optimal `eps` for DBSCAN using Elbow Method
+k = 5  # Same as min_samples in DBSCAN
+nbrs = NearestNeighbors(n_neighbors=k).fit(umap_embeddings)
+distances, indices = nbrs.kneighbors(umap_embeddings)
+
+# Sort distances
+distances = np.sort(distances[:, -1], axis=0)
+
+# Use Kneedle algorithm to find the elbow
+kneedle = KneeLocator(range(len(distances)), distances, curve="convex", direction="increasing")
+optimal_eps = distances[kneedle.knee]
+
+# 📌 Plot Elbow Curve
+plt.figure(figsize=(10, 6))
+plt.plot(distances, marker='o', linestyle='dashed', color='b', markersize=3, label="KNN Distance")
+plt.axvline(x=kneedle.knee, color='r', linestyle='--', label=f"Optimal eps={optimal_eps:.3f}")
+plt.xlabel("Points sorted by distance")
+plt.ylabel(f"{k}-Nearest Neighbor Distance")
+plt.title("Elbow Method for DBSCAN `eps` Selection")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+print(f"Optimal eps for DBSCAN: {optimal_eps:.3f}")
+
+# 📌 Step 6: Apply DBSCAN with Optimized `eps`
+dbscan = DBSCAN(eps=optimal_eps, min_samples=5, metric='euclidean', n_jobs=-1)
+labels = dbscan.fit_predict(umap_embeddings)
+
+# Save DBSCAN model and cluster labels
+joblib.dump(dbscan, "saved_models/dbscan_model.pkl")
+np.save("saved_models/cluster_labels.npy", labels)
+
+# 📌 Step 7: Define Silhouette Score Functions
+
+# Function to Calculate Silhouette Score
+def calculate_silhouette(umap_embeddings, labels):
+    """Computes the average Silhouette Score"""
+    valid_points = labels != -1  # Ignore noise points
+    filtered_embeddings = umap_embeddings[valid_points]
+    filtered_labels = labels[valid_points]
+
+    if len(set(filtered_labels)) > 1:  # At least 2 clusters required
+        avg_score = silhouette_score(filtered_embeddings, filtered_labels)
+        print(f"Silhouette Score: {avg_score:.4f}")
+        return avg_score
+    else:
+        print("Not enough clusters to compute Silhouette Score.")
+        return None
+
+# Function to Plot Silhouette Analysis
+def plot_silhouette(umap_embeddings, labels):
+    """Generates a detailed Silhouette Plot"""
+    n_clusters = len(np.unique(labels))
+    
+    if n_clusters < 2:
+        print("Not enough clusters to plot silhouette analysis.")
+        return
+
+    silhouette_vals = silhouette_samples(umap_embeddings, labels)
+    avg_score = silhouette_score(umap_embeddings, labels)
+
+    y_lower = 10
+    plt.figure(figsize=(10, 6))
+
+    for i in range(n_clusters):
+        if i == -1:  # Ignore noise
+            continue
+        ith_cluster_silhouette_vals = silhouette_vals[labels == i]
+        ith_cluster_silhouette_vals.sort()
+
+        size_cluster_i = ith_cluster_silhouette_vals.shape[0]
+        y_upper = y_lower + size_cluster_i
+
+        color = plt.cm.nipy_spectral(float(i) / n_clusters)
+        plt.fill_betweenx(np.arange(y_lower, y_upper), 0, ith_cluster_silhouette_vals,
+                          facecolor=color, edgecolor=color, alpha=0.7)
+
+        plt.text(-0.05, y_lower + 0.5 * size_cluster_i, str(i))
+        y_lower = y_upper + 10  # Add space between clusters
+
+    plt.axvline(x=avg_score, color="red", linestyle="--", label=f"Avg Silhouette Score: {avg_score:.3f}")
+    plt.xlabel("Silhouette Coefficient Values")
+    plt.ylabel("Cluster Label")
+    plt.title("Silhouette Plot for the Clusters")
+    plt.legend(loc="best")
+    plt.show()
+
+# 📌 Step 8: Run Silhouette Analysis
+avg_silhouette = calculate_silhouette(umap_embeddings, labels)
+plot_silhouette(umap_embeddings, labels)
+
+# 📌 Step 9: 3D Visualization of Clusters
+fig = plt.figure(figsize=(12, 8))
+ax = fig.add_subplot(111, projection='3d')
+
+scatter = ax.scatter(umap_embeddings[:, 0], umap_embeddings[:, 1], umap_embeddings[:, 2], 
+                     c=labels, cmap='Spectral', s=8, alpha=0.8)
+
+ax.set_title('3D Clusters after UMAP and Optimized DBSCAN')
+ax.set_xlabel('UMAP Dimension 1')
+ax.set_ylabel('UMAP Dimension 2')
+ax.set_zlabel('UMAP Dimension 3')
+
+plt.colorbar(scatter, label="Cluster Label")
+plt.show()
+
