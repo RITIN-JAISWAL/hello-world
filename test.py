@@ -503,14 +503,20 @@ plt.show()
 
 from kneed import KneeLocator
 
-# Use knee method to find optimal sample size
-knee = KneeLocator(sample_sizes, graph_counts, curve="convex", direction="increasing")
-optimal_samples = sample_sizes[knee.knee] if knee.knee is not None else max(sample_sizes)
+# Ensure sample_sizes and graph_counts are valid lists
+if len(sample_sizes) == 0 or len(graph_counts) == 0:
+    raise ValueError("Sample sizes or graph counts are empty. Check the data.")
 
-# Apply limits to avoid excessive computation
+# Use KneeLocator to find the optimal number of samples
+knee = KneeLocator(sample_sizes, graph_counts, curve="convex", direction="increasing")
+
+# Check if knee.knee is found and within range
+if knee.knee is not None and knee.knee < len(sample_sizes):
+    optimal_samples = sample_sizes[knee.knee]
+else:
+    optimal_samples = max(sample_sizes)  # Default to max sample size if no knee found
+
+# Apply a hard limit to prevent excessive computation
 optimal_samples = min(optimal_samples, int(0.1 * len(cleaned_journeys_df)), 50000)
 
 print(f"Final selected sample size: {optimal_samples}")
-
-
-
