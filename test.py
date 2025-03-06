@@ -471,3 +471,31 @@ plt.show()
 print(f"Best estimated epsilon for DBSCAN: {best_eps:.4f}")
 
 
+
+
+
+
+import matplotlib.pyplot as plt
+
+sample_sizes = [1000, 5000, 10000, 20000, 50000]
+graph_counts = []
+
+for size in sample_sizes:
+    temp_graph_list = []
+    for nodes in cleaned_journeys_df.path[:size]:
+        G = nx.Graph()
+        G.add_nodes_from(nodes)
+        edges = [(nodes[i], nodes[i + 1]) for i in range(len(nodes) - 1)]
+        G.add_edges_from(edges)
+        temp_graph_list.append(G)
+    
+    graph_counts.append(len(temp_graph_list))
+
+# Plot the curve
+plt.plot(sample_sizes, graph_counts, marker='o')
+plt.xlabel("Number of Samples")
+plt.ylabel("Number of Graphs Created")
+plt.title("Elbow Method for Sample Selection")
+plt.show()
+
+
