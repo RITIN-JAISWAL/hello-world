@@ -499,3 +499,18 @@ plt.title("Elbow Method for Sample Selection")
 plt.show()
 
 
+
+
+from kneed import KneeLocator
+
+# Use knee method to find optimal sample size
+knee = KneeLocator(sample_sizes, graph_counts, curve="convex", direction="increasing")
+optimal_samples = sample_sizes[knee.knee] if knee.knee is not None else max(sample_sizes)
+
+# Apply limits to avoid excessive computation
+optimal_samples = min(optimal_samples, int(0.1 * len(cleaned_journeys_df)), 50000)
+
+print(f"Final selected sample size: {optimal_samples}")
+
+
+
