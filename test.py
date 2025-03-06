@@ -520,3 +520,20 @@ else:
 optimal_samples = min(optimal_samples, int(0.1 * len(cleaned_journeys_df)), 50000)
 
 print(f"Final selected sample size: {optimal_samples}")
+
+
+
+
+
+import numpy as np
+
+# Step 1: Create a new column with default 'Not Clustered' (-1)
+cleaned_journeys_df["cluster"] = -1  # Assign -1 to indicate no cluster assigned
+
+# Step 2: Assign clusters only to the sampled data
+sampled_indices = cleaned_journeys_df.sample(n=50000, random_state=42).index  # Ensure correct sampling
+cleaned_journeys_df.loc[sampled_indices, "cluster"] = clusters  # Map clusters back
+
+# Step 3: Display updated dataset
+import ace_tools as tools
+tools.display_dataframe_to_user(name="Updated Dataset with Cluster Mapping", dataframe=cleaned_journeys_df)
