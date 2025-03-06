@@ -1,92 +1,86 @@
+
+Store embeddings in a DataFrame for analysis:
+
+
 import pandas as pd
-import numpy as np
-import networkx as nx
-from node2vec import Node2Vec
-import umap
-from sklearn.cluster import DBSCAN
+embeddings_df = pd.DataFrame(embeddings)
+embeddings_df.insert(0, "graph_id", range(len(embeddings)))  # Add IDs
+print(embeddings_df)
+
+
+Cluster similar journeys using KMeans:
+
+from sklearn.cluster import KMeans
+kmeans = KMeans(n_clusters=3, random_state=42).fit(embeddings)
+embeddings_df["cluster"] = kmeans.labels_
+
+
+Visualize clusters with PCA:
+
+from sklearn.decomposition import PCA
 import matplotlib.pyplot as plt
-from tqdm import tqdm  # For progress tracking
 
-# Load the large dataset (Assuming it's a CSV)
-df = pd.read_csv("large_dataset.csv")  # Update with actual file path
-df["path"] = df["path"].apply(eval)  # Convert string lists to actual lists
+pca = PCA(n_components=2)
+reduced_embeddings = pca.fit_transform(embeddings)
 
-# Initialize a Directed Graph
-G = nx.DiGraph()
-
-# Batch processing for large-scale graph construction
-for path in tqdm(df["path"], desc="Building Graph"):
-    edges = [(path[i], path[i+1]) for i in range(len(path)-1)]
-    G.add_edges_from(edges)
-
-# Node2Vec with optimized parameters
-node2vec = Node2Vec(G, 
-                    dimensions=128,   # Higher for more expressive embeddings
-                    walk_length=40, 
-                    num_walks=100, 
-                    workers=8,   # Utilize multiple CPU cores
-                    p=1, q=1)  # Balanced exploration and exploitation
-
-# Train Node2Vec
-model = node2vec.fit(window=10, min_count=1, batch_words=4)
-
-# Get node embeddings
-node_ids = list(model.wv.index_to_key)
-node_embeddings = np.array([model.wv[node] for node in node_ids])
-
-# Apply UMAP for Dimensionality Reduction
-umap_model = umap.UMAP(n_neighbors=30, 
-                        min_dist=0.1, 
-                        n_components=2, 
-                        random_state=42, 
-                        metric="cosine",
-                        verbose=True)  # Verbose for large dataset progress
-
-umap_embeddings = umap_model.fit_transform(node_embeddings)
-
-# Apply DBSCAN with tuned parameters
-dbscan = DBSCAN(eps=0.7, min_samples=5, metric='euclidean', n_jobs=-1)  # Use all CPU cores
-labels = dbscan.fit_predict(umap_embeddings)
-
-# Visualize the Clusters
-plt.figure(figsize=(12, 8))
-plt.scatter(umap_embeddings[:, 0], umap_embeddings[:, 1], c=labels, cmap='Spectral', s=5, alpha=0.7)
-plt.title('Clusters after UMAP and DBSCAN')
-plt.xlabel('UMAP Dimension 1')
-plt.ylabel('UMAP Dimension 2')
-plt.colorbar(label='Cluster Label')
+plt.scatter(reduced_embeddings[:,0], reduced_embeddings[:,1], c=kmeans.labels_, cmap='viridis')
+plt.title("Graph Embeddings Clustering")
+plt.xlabel("PCA 1")
+plt.ylabel("PCA 2")
 plt.show()
 
 
 
-
-
-
+DBSCAN:
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
-from sklearn.neighbors import NearestNeighbors
-import umap
+from sklearn.cluster import DBSCAN
+from sklearn.decomposition import PCA
 
-# UMAP Reduction (Assuming node_embeddings is already generated)
-umap_model = umap.UMAP(n_neighbors=30, min_dist=0.1, n_components=2, random_state=42, metric="cosine")
-umap_embeddings = umap_model.fit_transform(node_embeddings)
+# Assuming `embeddings` is your graph embedding matrix (Replace with actual embeddings)
+np.random.seed(42)
+embeddings = np.random.rand(10, 64)  # 10 graphs with 64 features each
 
-# Step 1: Compute the k-nearest neighbor distances
-k = 5  # min_samples for DBSCAN
-nbrs = NearestNeighbors(n_neighbors=k).fit(umap_embeddings)
-distances, indices = nbrs.kneighbors(umap_embeddings)
+# Convert embeddings to DataFrame
+embeddings_df = pd.DataFrame(embeddings)
 
-# Step 2: Sort and plot distances
-distances = np.sort(distances[:, -1], axis=0)  # Take the farthest k-th neighbor
+# **Apply DBSCAN Clustering**
+dbscan = DBSCAN(eps=0.5, min_samples=2)  # Adjust parameters as needed
+embeddings_df["dbscan_cluster"] = dbscan.fit_predict(embeddings)
 
-plt.figure(figsize=(10, 6))
-plt.plot(distances, marker='o', linestyle='dashed', color='b', markersize=3)
-plt.xlabel("Points sorted by distance")
-plt.ylabel(f"{k}-Nearest Neighbor Distance")
-plt.title("Elbow Method for DBSCAN `eps` Selection")
-plt.grid(True)
+# **Check Outliers (-1 indicates noise points)**
+outliers = embeddings_df[embeddings_df["dbscan_cluster"] == -1]
+print(f"Number of outliers detected: {len(outliers)}")
+
+# **Reduce dimensions using PCA for visualization**
+pca = PCA(n_components=2)
+reduced_embeddings = pca.fit_transform(embeddings)
+
+# **Scatter plot of DBSCAN clusters**
+plt.figure(figsize=(8, 6))
+plt.scatter(
+    reduced_embeddings[:, 0], reduced_embeddings[:, 1], 
+    c=embeddings_df["dbscan_cluster"], cmap="plasma", alpha=0.8
+)
+plt.title("DBSCAN Clustering of Graph Embeddings")
+plt.xlabel("PCA Component 1")
+plt.ylabel("PCA Component 2")
+plt.colorbar(label="DBSCAN Cluster ID")
 plt.show()
 
+# **Display clustering results**
+import ace_tools as tools
+tools.display_dataframe_to_user(name="DBSCAN Clustered Graph Embeddings", dataframe=embeddings_df)
+
+
+
+from sklearn.metrics import silhouette_score
+score = silhouette_score(embeddings, kmeans.labels_)
+print(f"Silhouette Score: {score}")
+
+
+dbscan = DBSCAN(eps=0.3, min_samples=5)
 
 
 
@@ -98,471 +92,216 @@ plt.show()
 
 
 
-
-
-
-
-
-
-
-
-here:
-# Install required libraries if not installed
-!pip install networkx node2vec umap-learn scikit-learn matplotlib kneed tqdm joblib
-
-# Import libraries
-import pandas as pd
+Original
 import numpy as np
+import pandas as pd
 import networkx as nx
-from node2vec import Node2Vec
-import umap
+from karateclub import Graph2Vec
+from sklearn.decomposition import PCA
 from sklearn.cluster import DBSCAN
-from sklearn.metrics import silhouette_score, davies_bouldin_score
-from sklearn.neighbors import NearestNeighbors
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
 from kneed import KneeLocator
-import matplotlib.pyplot as plt
-import collections
-import joblib  # For saving models
-from tqdm import tqdm
-import os
-
-# Create a directory to save models
-os.makedirs("saved_models", exist_ok=True)
-
-# 📌 Step 1: Load the dataset
-df = pd.read_csv("large_dataset.csv")  # Update with actual file path
-df["path"] = df["path"].apply(eval)  # Convert string lists to actual lists
-
-# 📌 Step 2: Construct a Directed Graph
-G = nx.DiGraph()
-
-for path in tqdm(df["path"], desc="Building Graph"):
-    edges = [(path[i], path[i+1]) for i in range(len(path)-1)]
-    G.add_edges_from(edges)
-
-# 📌 Step 3: Apply Node2Vec for Node Embeddings
-node2vec = Node2Vec(G, dimensions=128, walk_length=40, num_walks=100, workers=8, p=1, q=1)
-model = node2vec.fit(window=10, min_count=1, batch_words=4)
-
-# Save the Node2Vec model
-model.save("saved_models/node2vec.model")
-
-# Get node embeddings
-node_ids = list(model.wv.index_to_key)
-node_embeddings = np.array([model.wv[node] for node in node_ids])
-
-# 📌 Step 4: Apply UMAP for **3D** Dimensionality Reduction
-umap_model = umap.UMAP(n_neighbors=30, min_dist=0.1, n_components=3, random_state=42, metric="cosine", verbose=True)
-umap_embeddings = umap_model.fit_transform(node_embeddings)
-
-# Save the UMAP model
-joblib.dump(umap_model, "saved_models/umap_model.pkl")
-
-# 📌 Step 5: Find Optimal `eps` for DBSCAN using Elbow Method
-k = 5  # Same as min_samples in DBSCAN
-nbrs = NearestNeighbors(n_neighbors=k).fit(umap_embeddings)
-distances, indices = nbrs.kneighbors(umap_embeddings)
-
-# Sort distances
-distances = np.sort(distances[:, -1], axis=0)
-
-# Use Kneedle algorithm to find the elbow
-kneedle = KneeLocator(range(len(distances)), distances, curve="convex", direction="increasing")
-optimal_eps = distances[kneedle.knee]
-
-# 📌 Plot Elbow Curve
-plt.figure(figsize=(10, 6))
-plt.plot(distances, marker='o', linestyle='dashed', color='b', markersize=3, label="KNN Distance")
-plt.axvline(x=kneedle.knee, color='r', linestyle='--', label=f"Optimal eps={optimal_eps:.3f}")
-plt.xlabel("Points sorted by distance")
-plt.ylabel(f"{k}-Nearest Neighbor Distance")
-plt.title("Elbow Method for DBSCAN `eps` Selection")
-plt.legend()
-plt.grid(True)
-plt.show()
-
-print(f"Optimal eps for DBSCAN: {optimal_eps:.3f}")
-
-# 📌 Step 6: Apply DBSCAN with Optimized `eps`
-dbscan = DBSCAN(eps=optimal_eps, min_samples=5, metric='euclidean', n_jobs=-1)
-labels = dbscan.fit_predict(umap_embeddings)
-
-# Save DBSCAN model and cluster labels
-joblib.dump(dbscan, "saved_models/dbscan_model.pkl")
-np.save("saved_models/cluster_labels.npy", labels)
-
-# 📌 Step 7: Evaluate Clustering Quality
-
-# ✅ 1. Silhouette Score (Higher is better)
-valid_points = labels != -1
-filtered_embeddings = umap_embeddings[valid_points]
-filtered_labels = labels[valid_points]
-
-if len(set(filtered_labels)) > 1:  # Silhouette score needs at least 2 clusters
-    silhouette_avg = silhouette_score(filtered_embeddings, filtered_labels)
-    print(f"Silhouette Score: {silhouette_avg:.4f}")
-else:
-    print("Not enough clusters to compute Silhouette Score.")
-
-# ✅ 2. Davies-Bouldin Index (Lower is better)
-if len(set(filtered_labels)) > 1:
-    db_score = davies_bouldin_score(filtered_embeddings, filtered_labels)
-    print(f"Davies-Bouldin Index: {db_score:.4f}")
-else:
-    print("Not enough clusters to compute Davies-Bouldin Index.")
-
-# ✅ 3. Cluster Size Distribution
-cluster_counts = collections.Counter(labels)
-sorted_counts = sorted(cluster_counts.items())
-
-print("\nCluster Size Distribution:")
-for cluster_id, size in sorted_counts:
-    print(f"Cluster {cluster_id}: {size} points")
-
-# Plot Cluster Size Distribution
-plt.figure(figsize=(10, 5))
-plt.bar([x[0] for x in sorted_counts], [x[1] for x in sorted_counts], color="royalblue")
-plt.xlabel("Cluster ID")
-plt.ylabel("Number of Points")
-plt.title("Cluster Size Distribution")
-plt.show()
-
-# 📌 Step 8: 3D Visualization of Clusters
-fig = plt.figure(figsize=(12, 8))
-ax = fig.add_subplot(111, projection='3d')
-
-scatter = ax.scatter(umap_embeddings[:, 0], umap_embeddings[:, 1], umap_embeddings[:, 2], 
-                     c=labels, cmap='Spectral', s=8, alpha=0.8)
-
-ax.set_title('3D Clusters after UMAP and Optimized DBSCAN')
-ax.set_xlabel('UMAP Dimension 1')
-ax.set_ylabel('UMAP Dimension 2')
-ax.set_zlabel('UMAP Dimension 3')
-
-plt.colorbar(scatter, label="Cluster Label")
-plt.show()
-
-
-import joblib
-import numpy as np
-from node2vec import Node2Vec
-
-# Load Node2Vec Model
-loaded_node2vec = Node2Vec.load("saved_models/node2vec.model")
-print("✅ Node2Vec Model Loaded")
-
-# Load UMAP Model
-loaded_umap = joblib.load("saved_models/umap_model.pkl")
-print("✅ UMAP Model Loaded")
-
-# Load DBSCAN Model
-loaded_dbscan = joblib.load("saved_models/dbscan_model.pkl")
-print("✅ DBSCAN Model Loaded")
-
-# Load Cluster Labels
-loaded_labels = np.load("saved_models/cluster_labels.npy")
-print("✅ Cluster Labels Loaded")
-
-
-
-
-
-
-
-
-
-
-
-
-# Install required libraries if not already installed
-!pip install networkx node2vec umap-learn scikit-learn matplotlib kneed tqdm
-
-# Import libraries
-import pandas as pd
-import numpy as np
-import networkx as nx
-from node2vec import Node2Vec
-import umap
-from sklearn.cluster import DBSCAN
-from sklearn.metrics import silhouette_score, davies_bouldin_score
 from sklearn.neighbors import NearestNeighbors
-from kneed import KneeLocator
-import matplotlib.pyplot as plt
-import collections
-from tqdm import tqdm
 
-# 📌 Step 1: Load the dataset
-df = pd.read_csv("large_dataset.csv")  # Update with actual file path
-df["path"] = df["path"].apply(eval)  # Convert string lists to actual lists
+# Load dataset (Assuming cleaned_journeys_df is available)
+# cleaned_journeys_df = pd.read_csv("your_data.csv")  # Load if needed
 
-# 📌 Step 2: Construct a Directed Graph
-G = nx.DiGraph()
+# Convert paths to graphs
+graph_list = []
+session_ids = []
 
-for path in tqdm(df["path"], desc="Building Graph"):
-    edges = [(path[i], path[i+1]) for i in range(len(path)-1)]
-    G.add_edges_from(edges)
-
-# 📌 Step 3: Apply Node2Vec for Node Embeddings
-node2vec = Node2Vec(G, dimensions=128, walk_length=40, num_walks=100, workers=8, p=1, q=1)
-model = node2vec.fit(window=10, min_count=1, batch_words=4)
-
-# Get node embeddings
-node_ids = list(model.wv.index_to_key)
-node_embeddings = np.array([model.wv[node] for node in node_ids])
-
-# 📌 Step 4: Apply UMAP for Dimensionality Reduction
-umap_model = umap.UMAP(n_neighbors=30, min_dist=0.1, n_components=2, random_state=42, metric="cosine", verbose=True)
-umap_embeddings = umap_model.fit_transform(node_embeddings)
-
-# 📌 Step 5: Find Optimal `eps` for DBSCAN using Elbow Method
-k = 5  # Same as min_samples in DBSCAN
-nbrs = NearestNeighbors(n_neighbors=k).fit(umap_embeddings)
-distances, indices = nbrs.kneighbors(umap_embeddings)
-
-# Sort distances
-distances = np.sort(distances[:, -1], axis=0)
-
-# Use Kneedle algorithm to find the elbow
-kneedle = KneeLocator(range(len(distances)), distances, curve="convex", direction="increasing")
-optimal_eps = distances[kneedle.knee]
-
-# 📌 Plot Elbow Curve
-plt.figure(figsize=(10, 6))
-plt.plot(distances, marker='o', linestyle='dashed', color='b', markersize=3, label="KNN Distance")
-plt.axvline(x=kneedle.knee, color='r', linestyle='--', label=f"Optimal eps={optimal_eps:.3f}")
-plt.xlabel("Points sorted by distance")
-plt.ylabel(f"{k}-Nearest Neighbor Distance")
-plt.title("Elbow Method for DBSCAN `eps` Selection")
-plt.legend()
-plt.grid(True)
-plt.show()
-
-print(f"Optimal eps for DBSCAN: {optimal_eps:.3f}")
-
-# 📌 Step 6: Apply DBSCAN with Optimized `eps`
-dbscan = DBSCAN(eps=optimal_eps, min_samples=5, metric='euclidean', n_jobs=-1)
-labels = dbscan.fit_predict(umap_embeddings)
-
-# 📌 Step 7: Evaluate Clustering Quality
-
-# ✅ 1. Silhouette Score (Higher is better)
-valid_points = labels != -1
-filtered_embeddings = umap_embeddings[valid_points]
-filtered_labels = labels[valid_points]
-
-if len(set(filtered_labels)) > 1:  # Silhouette score needs at least 2 clusters
-    silhouette_avg = silhouette_score(filtered_embeddings, filtered_labels)
-    print(f"Silhouette Score: {silhouette_avg:.4f}")
-else:
-    print("Not enough clusters to compute Silhouette Score.")
-
-# ✅ 2. Davies-Bouldin Index (Lower is better)
-if len(set(filtered_labels)) > 1:
-    db_score = davies_bouldin_score(filtered_embeddings, filtered_labels)
-    print(f"Davies-Bouldin Index: {db_score:.4f}")
-else:
-    print("Not enough clusters to compute Davies-Bouldin Index.")
-
-# ✅ 3. Cluster Size Distribution
-cluster_counts = collections.Counter(labels)
-sorted_counts = sorted(cluster_counts.items())
-
-print("\nCluster Size Distribution:")
-for cluster_id, size in sorted_counts:
-    print(f"Cluster {cluster_id}: {size} points")
-
-# Plot Cluster Size Distribution
-plt.figure(figsize=(10, 5))
-plt.bar([x[0] for x in sorted_counts], [x[1] for x in sorted_counts], color="royalblue")
-plt.xlabel("Cluster ID")
-plt.ylabel("Number of Points")
-plt.title("Cluster Size Distribution")
-plt.show()
-
-# 📌 Step 8: Visualize the Clusters
-plt.figure(figsize=(12, 8))
-plt.scatter(umap_embeddings[:, 0], umap_embeddings[:, 1], c=labels, cmap='Spectral', s=5, alpha=0.7)
-plt.title('Clusters after UMAP and Optimized DBSCAN')
-plt.xlabel('UMAP Dimension 1')
-plt.ylabel('UMAP Dimension 2')
-plt.colorbar(label='Cluster Label')
-plt.show()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# Install required libraries if not installed
-!pip install networkx node2vec umap-learn scikit-learn matplotlib kneed tqdm
-
-# Import libraries
-import pandas as pd
-import numpy as np
-import networkx as nx
-from node2vec import Node2Vec
-import umap
-from sklearn.cluster import DBSCAN
-from sklearn.metrics import silhouette_score, silhouette_samples, davies_bouldin_score
-from sklearn.neighbors import NearestNeighbors
-from kneed import KneeLocator
-import matplotlib.pyplot as plt
-import collections
-from tqdm import tqdm
-import joblib
-import os
-
-# Create a directory to save models
-os.makedirs("saved_models", exist_ok=True)
-
-# 📌 Step 1: Load the dataset
-df = pd.read_csv("large_dataset.csv")  # Update with actual file path
-df["path"] = df["path"].apply(eval)  # Convert string lists to actual lists
-
-# 📌 Step 2: Construct a Directed Graph
-G = nx.DiGraph()
-
-for path in tqdm(df["path"], desc="Building Graph"):
-    edges = [(path[i], path[i+1]) for i in range(len(path)-1)]
-    G.add_edges_from(edges)
-
-# 📌 Step 3: Apply Node2Vec for Node Embeddings
-node2vec = Node2Vec(G, dimensions=128, walk_length=40, num_walks=100, workers=8, p=1, q=1)
-model = node2vec.fit(window=10, min_count=1, batch_words=4)
-
-# Save the Node2Vec model
-model.save("saved_models/node2vec.model")
-
-# Get node embeddings
-node_ids = list(model.wv.index_to_key)
-node_embeddings = np.array([model.wv[node] for node in node_ids])
-
-# 📌 Step 4: Apply UMAP for **3D** Dimensionality Reduction
-umap_model = umap.UMAP(n_neighbors=30, min_dist=0.1, n_components=3, random_state=42, metric="cosine", verbose=True)
-umap_embeddings = umap_model.fit_transform(node_embeddings)
-
-# Save the UMAP model
-joblib.dump(umap_model, "saved_models/umap_model.pkl")
-
-# 📌 Step 5: Find Optimal `eps` for DBSCAN using Elbow Method
-k = 5  # Same as min_samples in DBSCAN
-nbrs = NearestNeighbors(n_neighbors=k).fit(umap_embeddings)
-distances, indices = nbrs.kneighbors(umap_embeddings)
-
-# Sort distances
-distances = np.sort(distances[:, -1], axis=0)
-
-# Use Kneedle algorithm to find the elbow
-kneedle = KneeLocator(range(len(distances)), distances, curve="convex", direction="increasing")
-optimal_eps = distances[kneedle.knee]
-
-# 📌 Plot Elbow Curve
-plt.figure(figsize=(10, 6))
-plt.plot(distances, marker='o', linestyle='dashed', color='b', markersize=3, label="KNN Distance")
-plt.axvline(x=kneedle.knee, color='r', linestyle='--', label=f"Optimal eps={optimal_eps:.3f}")
-plt.xlabel("Points sorted by distance")
-plt.ylabel(f"{k}-Nearest Neighbor Distance")
-plt.title("Elbow Method for DBSCAN `eps` Selection")
-plt.legend()
-plt.grid(True)
-plt.show()
-
-print(f"Optimal eps for DBSCAN: {optimal_eps:.3f}")
-
-# 📌 Step 6: Apply DBSCAN with Optimized `eps`
-dbscan = DBSCAN(eps=optimal_eps, min_samples=5, metric='euclidean', n_jobs=-1)
-labels = dbscan.fit_predict(umap_embeddings)
-
-# Save DBSCAN model and cluster labels
-joblib.dump(dbscan, "saved_models/dbscan_model.pkl")
-np.save("saved_models/cluster_labels.npy", labels)
-
-# 📌 Step 7: Define Silhouette Score Functions
-
-# Function to Calculate Silhouette Score
-def calculate_silhouette(umap_embeddings, labels):
-    """Computes the average Silhouette Score"""
-    valid_points = labels != -1  # Ignore noise points
-    filtered_embeddings = umap_embeddings[valid_points]
-    filtered_labels = labels[valid_points]
-
-    if len(set(filtered_labels)) > 1:  # At least 2 clusters required
-        avg_score = silhouette_score(filtered_embeddings, filtered_labels)
-        print(f"Silhouette Score: {avg_score:.4f}")
-        return avg_score
-    else:
-        print("Not enough clusters to compute Silhouette Score.")
-        return None
-
-# Function to Plot Silhouette Analysis
-def plot_silhouette(umap_embeddings, labels):
-    """Generates a detailed Silhouette Plot"""
-    n_clusters = len(np.unique(labels))
+n_samples = 1000  # Adjust based on computational power
+for index, nodes in enumerate(cleaned_journeys_df.path[:n_samples]):
+    G = nx.Graph()
     
-    if n_clusters < 2:
-        print("Not enough clusters to plot silhouette analysis.")
-        return
+    # Add nodes
+    G.add_nodes_from(nodes)
+    
+    # Add edges (Sequential path connections)
+    edges = [(nodes[i], nodes[i+1]) for i in range(len(nodes) - 1)]
+    G.add_edges_from(edges)
+    
+    # Standardize node labels
+    G = nx.convert_node_labels_to_integers(G, first_label=0)
+    
+    graph_list.append(G)
+    session_ids.append(cleaned_journeys_df.channel_visit_id.iloc[index])
 
-    silhouette_vals = silhouette_samples(umap_embeddings, labels)
-    avg_score = silhouette_score(umap_embeddings, labels)
+# Train Graph2Vec for embeddings
+model = Graph2Vec(dimensions=64, wl_iterations=2, attributed=False)
+model.fit(graph_list)
+embeddings = model.get_embedding()
 
-    y_lower = 10
-    plt.figure(figsize=(10, 6))
+# Convert embeddings to DataFrame
+embedding_df = pd.DataFrame(embeddings, columns=[f"dim_{i}" for i in range(64)])
+embedding_df["session_id"] = session_ids
 
-    for i in range(n_clusters):
-        if i == -1:  # Ignore noise
-            continue
-        ith_cluster_silhouette_vals = silhouette_vals[labels == i]
-        ith_cluster_silhouette_vals.sort()
+# Find optimal PCA dimensions using explained variance
+pca = PCA()
+pca.fit(embeddings)
 
-        size_cluster_i = ith_cluster_silhouette_vals.shape[0]
-        y_upper = y_lower + size_cluster_i
-
-        color = plt.cm.nipy_spectral(float(i) / n_clusters)
-        plt.fill_betweenx(np.arange(y_lower, y_upper), 0, ith_cluster_silhouette_vals,
-                          facecolor=color, edgecolor=color, alpha=0.7)
-
-        plt.text(-0.05, y_lower + 0.5 * size_cluster_i, str(i))
-        y_lower = y_upper + 10  # Add space between clusters
-
-    plt.axvline(x=avg_score, color="red", linestyle="--", label=f"Avg Silhouette Score: {avg_score:.3f}")
-    plt.xlabel("Silhouette Coefficient Values")
-    plt.ylabel("Cluster Label")
-    plt.title("Silhouette Plot for the Clusters")
-    plt.legend(loc="best")
-    plt.show()
-
-# 📌 Step 8: Run Silhouette Analysis
-avg_silhouette = calculate_silhouette(umap_embeddings, labels)
-plot_silhouette(umap_embeddings, labels)
-
-# 📌 Step 9: 3D Visualization of Clusters
-fig = plt.figure(figsize=(12, 8))
-ax = fig.add_subplot(111, projection='3d')
-
-scatter = ax.scatter(umap_embeddings[:, 0], umap_embeddings[:, 1], umap_embeddings[:, 2], 
-                     c=labels, cmap='Spectral', s=8, alpha=0.8)
-
-ax.set_title('3D Clusters after UMAP and Optimized DBSCAN')
-ax.set_xlabel('UMAP Dimension 1')
-ax.set_ylabel('UMAP Dimension 2')
-ax.set_zlabel('UMAP Dimension 3')
-
-plt.colorbar(scatter, label="Cluster Label")
+# Plot explained variance
+plt.figure(figsize=(8, 5))
+plt.plot(range(1, 65), np.cumsum(pca.explained_variance_ratio_), marker='o')
+plt.xlabel("Number of PCA Components")
+plt.ylabel("Cumulative Explained Variance")
+plt.title("Optimal PCA Dimension Selection")
+plt.grid()
 plt.show()
+
+# Choose dimension where variance stabilizes (e.g., 90% variance)
+optimal_pca_dim = np.argmax(np.cumsum(pca.explained_variance_ratio_) >= 0.90) + 1
+print(f"Optimal PCA Dimension: {optimal_pca_dim}")
+
+# Apply PCA with the chosen dimensions
+pca = PCA(n_components=optimal_pca_dim)
+reduced_embeddings_pca = pca.fit_transform(embeddings)
+
+# Find the best `eps` for DBSCAN using K-Nearest Neighbors (KNN)
+nearest_neighbors = NearestNeighbors(n_neighbors=10)
+nearest_neighbors.fit(reduced_embeddings_pca)
+distances, indices = nearest_neighbors.kneighbors(reduced_embeddings_pca)
+
+# Sort and find the knee point
+sorted_distances = np.sort(distances[:, -1])
+kneedle = KneeLocator(range(1, len(sorted_distances) + 1), sorted_distances, curve="convex", direction="increasing")
+optimal_eps = sorted_distances[kneedle.knee]
+print(f"Optimal DBSCAN eps: {optimal_eps}")
+
+# Apply DBSCAN with the best epsilon
+dbscan = DBSCAN(eps=optimal_eps, min_samples=5)
+clusters = dbscan.fit_predict(reduced_embeddings_pca)
+
+# Add clustering results to DataFrame
+embedding_df["cluster"] = clusters
+
+# Apply t-SNE for visualization
+tsne = TSNE(n_components=2, perplexity=30, random_state=42)
+reduced_embeddings_tsne = tsne.fit_transform(reduced_embeddings_pca)
+
+# Plot clusters using t-SNE
+plt.figure(figsize=(10, 6))
+plt.scatter(reduced_embeddings_tsne[:, 0], reduced_embeddings_tsne[:, 1], c=clusters, cmap='viridis', alpha=0.7)
+plt.colorbar(label="Cluster")
+plt.xlabel("t-SNE Component 1")
+plt.ylabel("t-SNE Component 2")
+plt.title("DBSCAN Clusters Visualized using t-SNE")
+plt.show()
+
+# Save results if needed
+embedding_df.to_csv("graph_embeddings_dbscan_clusters.csv", index=False)
+
+
+
+from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
+import seaborn as sns
+
+# Remove noise points (DBSCAN assigns -1 to noise)
+valid_clusters = embedding_df[embedding_df["cluster"] != -1]
+
+# Compute validation metrics
+sil_score = silhouette_score(valid_clusters.iloc[:, :-2], valid_clusters["cluster"])
+db_index = davies_bouldin_score(valid_clusters.iloc[:, :-2], valid_clusters["cluster"])
+ch_index = calinski_harabasz_score(valid_clusters.iloc[:, :-2], valid_clusters["cluster"])
+
+print(f"Silhouette Score: {sil_score:.4f} (Higher is better)")
+print(f"Davies-Bouldin Index: {db_index:.4f} (Lower is better)")
+print(f"Calinski-Harabasz Index: {ch_index:.4f} (Higher is better)")
+
+# Count points per cluster
+cluster_counts = valid_clusters["cluster"].value_counts().sort_index()
+
+# Plot Cluster Size Distribution
+plt.figure(figsize=(8, 5))
+sns.barplot(x=cluster_counts.index, y=cluster_counts.values, palette="viridis")
+plt.xlabel("Cluster Label")
+plt.ylabel("Number of Points")
+plt.title("Cluster Size Distribution")
+plt.xticks(rotation=45)
+plt.show()
+
+
+
+# Map cluster labels back to the original DataFrame
+cleaned_journeys_df["cluster"] = -1  # Default to -1 (unclustered/noise)
+
+# Update only valid session IDs
+for idx, session_id in enumerate(valid_clusters["session_id"]):
+    cleaned_journeys_df.loc[cleaned_journeys_df["channel_visit_id"] == session_id, "cluster"] = valid_clusters.iloc[idx]["cluster"]
+
+# Display cluster mappings
+import ace_tools as tools
+tools.display_dataframe_to_user(name="Clustered Journeys DataFrame", dataframe=cleaned_journeys_df)
+
+# Save the updated DataFrame if needed
+cleaned_journeys_df.to_csv("cleaned_journeys_with_clusters.csv", index=False)
+
+# Print example of paths per cluster
+for cluster_id in cleaned_journeys_df["cluster"].unique():
+    if cluster_id == -1:
+        print(f"\nCluster {cluster_id} (Noise/Outliers):")
+    else:
+        print(f"\nCluster {cluster_id}:")
+    
+    example_paths = cleaned_journeys_df[cleaned_journeys_df["cluster"] == cluster_id]["path"].head(5).tolist()
+    
+    for path in example_paths:
+        print(f"  - {path}")
+
+
+
+
+
+
+
+
+
+
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, classification_report
+import ace_tools as tools  # For displaying data
+
+# Assuming we have a target variable (user behavior) in cleaned_journeys_df
+# Example: cleaned_journeys_df["target"] = 1 if user converted, 0 otherwise
+# You need to define "target" based on business logic.
+
+# Ensure we have target variable
+if "target" not in cleaned_journeys_df.columns:
+    raise ValueError("Target variable ('target') not found! Please define user behavior outcomes.")
+
+# Prepare data
+X = embedding_df.drop(columns=["session_id", "cluster"])  # Use embeddings as features
+y = cleaned_journeys_df["target"][:len(X)]  # Ensure target aligns with embeddings
+
+# Split data into training & testing
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# Train Logistic Regression Model
+log_model = LogisticRegression(max_iter=500)
+log_model.fit(X_train, y_train)
+y_pred_log = log_model.predict(X_test)
+
+# Train Random Forest Model
+rf_model = RandomForestClassifier(n_estimators=100, random_state=42)
+rf_model.fit(X_train, y_train)
+y_pred_rf = rf_model.predict(X_test)
+
+# Evaluate Performance
+log_report = classification_report(y_test, y_pred_log, output_dict=True)
+rf_report = classification_report(y_test, y_pred_rf, output_dict=True)
+
+# Display results
+log_df = pd.DataFrame(log_report).T
+rf_df = pd.DataFrame(rf_report).T
+
+tools.display_dataframe_to_user(name="Logistic Regression Report", dataframe=log_df)
+tools.display_dataframe_to_user(name="Random Forest Report", dataframe=rf_df)
+
+print(f"Logistic Regression Accuracy: {accuracy_score(y_test, y_pred_log):.4f}")
+print(f"Random Forest Accuracy: {accuracy_score(y_test, y_pred_rf):.4f}")
+
+
 
