@@ -385,3 +385,89 @@ print(f"Best estimated epsilon for DBSCAN: {best_eps:.4f}")
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+from sklearn.neighbors import NearestNeighbors
+from sklearn.cluster import DBSCAN
+from kneed import KneeLocator
+
+# Assuming 'embeddings' contains Graph2Vec representations
+embeddings_df = pd.DataFrame(embeddings)
+
+# Step 1: Determine the best number of PCA components
+pca_full = PCA()
+pca_full.fit(embeddings_df)
+
+# Calculate cumulative explained variance
+cumulative_variance = np.cumsum(pca_full.explained_variance_ratio_)
+
+# Find the number of dimensions that explain at least 95% of the variance
+optimal_pca_components = np.argmax(cumulative_variance >= 0.95) + 1
+
+print(f"Optimal number of PCA components: {optimal_pca_components}")
+
+# Step 2: Apply PCA with the estimated optimal number of components
+pca_final = PCA(n_components=optimal_pca_components)
+pca_reduced_embeddings = pca_final.fit_transform(embeddings_df)
+
+print(f"PCA applied: Reduced embeddings from {embeddings_df.shape[1]} to {pca_reduced_embeddings.shape[1]} dimensions")
+
+# Step 3: Estimate best epsilon using Knee method on reduced embeddings
+nearest_neighbors = NearestNeighbors(n_neighbors=5)
+nearest_neighbors.fit(pca_reduced_embeddings)
+distances, indices = nearest_neighbors.kneighbors(pca_reduced_embeddings)
+
+# Sort distances for knee plot
+sorted_distances = np.sort(distances[:, -1])
+
+# Find knee point
+knee = KneeLocator(range(len(sorted_distances)), sorted_distances, curve="convex", direction="increasing")
+best_eps = sorted_distances[knee.knee]
+
+# Step 4: Apply DBSCAN clustering on PCA-reduced data
+dbscan = DBSCAN(eps=best_eps, min_samples=5)  # min_samples can be tuned
+clusters = dbscan.fit_predict(pca_reduced_embeddings)
+
+# Step 5: Assign clusters to session IDs
+cleaned_journeys_df["cluster"] = clusters
+
+# Step 6: Visualize clusters using PCA (top 2 components)
+plt.figure(figsize=(8, 6))
+plt.scatter(pca_reduced_embeddings[:, 0], pca_reduced_embeddings[:, 1], c=clusters, cmap='viridis', alpha=0.6)
+plt.colorbar(label="Cluster")
+plt.xlabel("PCA Component 1")
+plt.ylabel("PCA Component 2")
+plt.title("User Journey Clusters (PCA)")
+plt.show()
+
+# Step 7: Display session cluster assignment
+session_cluster_df = cleaned_journeys_df[['channel_visit_id', 'cluster']]
+import ace_tools as tools
+tools.display_dataframe_to_user(name="Session Clusters", dataframe=session_cluster_df)
+
+# Step 8: Show the knee plot
+plt.figure(figsize=(8, 4))
+plt.plot(range(len(sorted_distances)), sorted_distances, label="K-distance")
+plt.axvline(x=knee.knee, color='r', linestyle='--', label=f"Knee at {best_eps:.4f}")
+plt.xlabel("Data Points Sorted by Distance")
+plt.ylabel("5th Nearest Neighbor Distance")
+plt.title("Knee Plot for Best Epsilon Selection")
+plt.legend()
+plt.show()
+
+print(f"Best estimated epsilon for DBSCAN: {best_eps:.4f}")
+
+
