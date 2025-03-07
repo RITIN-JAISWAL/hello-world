@@ -673,3 +673,113 @@ plt.ylabel("Reconstruction Error")
 plt.title("Choosing Best n_components for UMAP")
 plt.show()
 
+
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import umap
+from sklearn.decomposition import PCA
+from sklearn.cluster import DBSCAN
+from sklearn.metrics import silhouette_score, davies_bouldin_score
+from sklearn.neighbors import NearestNeighbors
+from kneed import KneeLocator
+
+# Assume 'embeddings' is a numpy array or DataFrame containing the embeddings
+embeddings_df = pd.DataFrame(embeddings)
+
+### Step 1: Dimensionality Reduction - Choose between PCA and UMAP ###
+pca = PCA(n_components=min(50, embeddings_df.shape[1]))  # Reduce to 50 or available dimensions
+pca_embeddings = pca.fit_transform(embeddings_df)
+explained_variance = np.sum(pca.explained_variance_ratio_)
+
+# Apply UMAP for comparison
+umap_50d = umap.UMAP(n_components=min(50, embeddings_df.shape[1]), random_state=42)
+umap_embeddings = umap_50d.fit_transform(embeddings_df)
+
+# Select the best method based on variance retention
+if explained_variance > 0.90:
+    reduced_embeddings = pca_embeddings
+    reduction_method = "PCA"
+else:
+    reduced_embeddings = umap_embeddings
+    reduction_method = "UMAP"
+
+print(f"Selected Dimensionality Reduction Method: {reduction_method}")
+
+### Step 2: Estimate Best Epsilon for DBSCAN ###
+nearest_neighbors = NearestNeighbors(n_neighbors=5)
+nearest_neighbors.fit(reduced_embeddings)
+distances, _ = nearest_neighbors.kneighbors(reduced_embeddings)
+
+# Sort distances for knee plot
+sorted_distances = np.sort(distances[:, -1])
+
+# Find the knee point
+knee = KneeLocator(range(len(sorted_distances)), sorted_distances, curve="convex", direction="increasing")
+best_eps = sorted_distances[knee.knee] if knee.knee is not None else np.percentile(sorted_distances, 95)
+
+print(f"Best Estimated Epsilon for DBSCAN: {best_eps:.4f}")
+
+### Step 3: Apply DBSCAN ###
+dbscan = DBSCAN(eps=best_eps, min_samples=5)
+clusters = dbscan.fit_predict(reduced_embeddings)
+
+### Step 4: Evaluate Clustering Performance ###
+unique_clusters, counts = np.unique(clusters, return_counts=True)
+cluster_distribution = dict(zip(unique_clusters, counts))
+
+# Silhouette Score (only valid clusters)
+valid_cluster_mask = clusters != -1
+silhouette = silhouette_score(reduced_embeddings[valid_cluster_mask], clusters[valid_cluster_mask]) if np.sum(valid_cluster_mask) > 1 else None
+
+# Davies-Bouldin Score
+db_score = davies_bouldin_score(reduced_embeddings[valid_cluster_mask], clusters[valid_cluster_mask]) if np.sum(valid_cluster_mask) > 1 else None
+
+### Step 5: Reduce to 2D for Visualization ###
+if reduction_method == "PCA":
+    vis_reducer = PCA(n_components=2)
+else:
+    vis_reducer = umap.UMAP(n_components=2, random_state=42)
+
+visual_embeddings = vis_reducer.fit_transform(reduced_embeddings)
+
+### Step 6: Generate Evaluation Summary ###
+evaluation_results = {
+    "Selected Reduction Method": reduction_method,
+    "Explained Variance (PCA)": explained_variance,
+    "Best Estimated Epsilon (DBSCAN)": best_eps,
+    "Number of Clusters (Excluding Noise)": len(unique_clusters) - (1 if -1 in unique_clusters else 0),
+    "Noise Points (-1)": cluster_distribution.get(-1, 0),
+    "Silhouette Score": silhouette,
+    "Davies-Bouldin Score": db_score,
+    "Cluster Distribution": cluster_distribution
+}
+
+# Convert to DataFrame for easy display
+evaluation_df = pd.DataFrame([evaluation_results])
+
+### Step 7: Display Cluster Visualization ###
+plt.figure(figsize=(8, 6))
+plt.scatter(visual_embeddings[:, 0], visual_embeddings[:, 1], c=clusters, cmap='viridis', alpha=0.6)
+plt.colorbar(label="Cluster")
+plt.xlabel(f"{reduction_method} Component 1")
+plt.ylabel(f"{reduction_method} Component 2")
+plt.title(f"Cluster Visualization ({reduction_method})")
+plt.show()
+
+### Step 8: Show Knee Plot for Epsilon Selection ###
+plt.figure(figsize=(8, 4))
+plt.plot(range(len(sorted_distances)), sorted_distances, label="Sorted K-distances")
+plt.axvline(x=knee.knee, color='r', linestyle='--', label=f"Knee at {best_eps:.4f}")
+plt.xlabel("Data Points Sorted by Distance")
+plt.ylabel("5th Nearest Neighbor Distance")
+plt.title("Knee Plot for Best Epsilon Selection")
+plt.legend()
+plt.show()
+
+### Step 9: Display Evaluation Metrics ###
+import ace_tools as tools
+tools.display_dataframe_to_user(name="Embedding Evaluation", dataframe=evaluation_df)
+
+
