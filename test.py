@@ -630,3 +630,46 @@ plt.show()
 session_cluster_df = cleaned_journeys_df[['channel_visit_id', 'cluster']]
 import ace_tools as tools
 tools.display_dataframe_to_user(name="Session Clusters", dataframe=session_cluster_df)
+
+
+
+
+
+
+
+
+import umap
+import numpy as np
+from sklearn.metrics import mean_squared_error
+
+# Try different n_components
+components_list = [2, 10, 20, 50, 100]
+errors = []
+
+for n in components_list:
+    reducer = umap.UMAP(n_components=n, random_state=42)
+    reduced = reducer.fit_transform(embeddings_df)
+    reconstructed = reducer.inverse_transform(reduced)  # Reconstruct to original space
+    error = mean_squared_error(embeddings_df, reconstructed)
+    errors.append(error)
+    print(f"UMAP n_components={n} -> Reconstruction Error: {error:.6f}")
+
+# Find the elbow point (best tradeoff)
+best_n = components_list[np.argmin(errors)]
+print(f"Optimal n_components for UMAP: {best_n}")
+from sklearn.manifold import trustworthiness
+
+for n in components_list:
+    reducer = umap.UMAP(n_components=n, random_state=42)
+    reduced = reducer.fit_transform(embeddings_df)
+    trust = trustworthiness(embeddings_df, reduced)
+    print(f"UMAP n_components={n} -> Trustworthiness: {trust:.4f}")
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(8, 5))
+plt.plot(components_list, errors, marker="o")
+plt.xlabel("UMAP n_components")
+plt.ylabel("Reconstruction Error")
+plt.title("Choosing Best n_components for UMAP")
+plt.show()
+
