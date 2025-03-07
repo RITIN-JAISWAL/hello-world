@@ -783,3 +783,80 @@ import ace_tools as tools
 tools.display_dataframe_to_user(name="Embedding Evaluation", dataframe=evaluation_df)
 
 
+
+
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Convert embeddings to DataFrame
+embeddings_df = pd.DataFrame(embeddings)
+
+# Check shape (dimensions)
+print(f"Embeddings Shape: {embeddings_df.shape}")  # (num_graphs, embedding_size)
+
+# Check if any embeddings are all zeros (bad embeddings)
+zero_embeddings = (embeddings_df == 0).all(axis=1).sum()
+print(f"Number of all-zero embeddings: {zero_embeddings}")
+
+# Plot distribution of values in embeddings
+plt.figure(figsize=(8, 5))
+sns.histplot(embeddings_df.values.flatten(), bins=50, kde=True)
+plt.title("Distribution of Embedding Values")
+plt.xlabel("Embedding Value")
+plt.ylabel("Frequency")
+plt.show()
+
+
+
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+
+# Apply KMeans to check clustering quality
+kmeans = KMeans(n_clusters=5, random_state=42)
+cluster_labels = kmeans.fit_predict(embeddings_df)
+
+# Compute Silhouette Score
+silhouette = silhouette_score(embeddings_df, cluster_labels)
+print(f"Silhouette Score: {silhouette:.4f}")
+
+
+
+
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+
+# Reduce to 2D using PCA
+pca = PCA(n_components=2)
+pca_embeddings = pca.fit_transform(embeddings_df)
+
+plt.figure(figsize=(8, 6))
+plt.scatter(pca_embeddings[:, 0], pca_embeddings[:, 1], c=cluster_labels, cmap='viridis', alpha=0.6)
+plt.colorbar(label="Cluster")
+plt.xlabel("PCA Component 1")
+plt.ylabel("PCA Component 2")
+plt.title("Graph Embeddings Clustering (PCA)")
+plt.show()
+
+# Reduce to 2D using t-SNE
+tsne = TSNE(n_components=2, perplexity=30, random_state=42)
+tsne_embeddings = tsne.fit_transform(embeddings_df)
+
+plt.figure(figsize=(8, 6))
+plt.scatter(tsne_embeddings[:, 0], tsne_embeddings[:, 1], c=cluster_labels, cmap='viridis', alpha=0.6)
+plt.colorbar(label="Cluster")
+plt.xlabel("t-SNE Component 1")
+plt.ylabel("t-SNE Component 2")
+plt.title("Graph Embeddings Clustering (t-SNE)")
+plt.show()
+
+
+
+# Compute explained variance of PCA
+explained_variance = np.sum(pca.explained_variance_ratio_)
+print(f"Explained Variance in PCA: {explained_variance:.4%}")
+
+
+
