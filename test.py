@@ -86,3 +86,51 @@ normalized_embeddings = scaler.fit_transform(embeddings)
 # Reduce with PCA
 pca = PCA(n_components=10)
 pca_embeddings = pca.fit_transform(normalized_embeddings)
+
+
+
+
+import hdbscan
+import numpy as np
+from sklearn.metrics import silhouette_score
+
+# Define parameter grid for tuning
+param_grid = {
+    'min_cluster_size': [5, 10, 20, 50],
+    'min_samples': [1, 5, 10, 20],
+    'cluster_selection_epsilon': [0.01, 0.05, 0.1, 0.2]
+}
+
+# Track best parameters and score
+best_params = None
+best_score = -1
+
+# Iterate over all parameter combinations
+for min_cluster_size in param_grid['min_cluster_size']:
+    for min_samples in param_grid['min_samples']:
+        for epsilon in param_grid['cluster_selection_epsilon']:
+            
+            # Initialize and fit HDBSCAN
+            hdb = hdbscan.HDBSCAN(min_cluster_size=min_cluster_size,
+                                  min_samples=min_samples,
+                                  cluster_selection_epsilon=epsilon)
+            clusters = hdb.fit_predict(reduced_embeddings)
+            
+            # Filter out noise (-1) for silhouette score
+            valid_indices = clusters != -1
+            if len(set(clusters[valid_indices])) > 1:
+                score = silhouette_score(reduced_embeddings[valid_indices], clusters[valid_indices])
+            else:
+                score = -1  # Invalid clustering scenario
+            
+            print(f"Params: min_cluster_size={min_cluster_size}, min_samples={min_samples}, epsilon={epsilon}, Silhouette Score={score:.4f}")
+
+            # Update best score and parameters
+            if score > best_score:
+                best_score = score
+                best_params = (min_cluster_size, min_samples, epsilon)
+
+print("\n✅ Best Parameters:")
+print(f"min_cluster_size = {best_params[0]}, min_samples = {best_params[1]}, epsilon = {best_params[2]}")
+print(f"Best Silhouette Score: {best_score:.4f}")
+
