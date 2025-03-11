@@ -251,3 +251,21 @@ clustered_points.to_csv("clustered_points.csv", index=False)
 
 print("\n✅ Cluster analysis completed and exported.")
 
+
+
+
+from sklearn.metrics import silhouette_score, davies_bouldin_score
+
+# Filter out noise points
+filtered_df = cleaned_journeys_df[cleaned_journeys_df['cluster'] != -1]
+filtered_embeddings = reduced_embeddings[filtered_df.index]
+filtered_labels = filtered_df['cluster'].values
+
+# Calculate Silhouette Score
+silhouette = silhouette_score(filtered_embeddings, filtered_labels)
+print(f"Silhouette Score: {silhouette:.4f}")
+
+# Calculate Davies-Bouldin Score
+david_bouldin = davies_bouldin_score(filtered_embeddings, filtered_labels)
+print(f"Davies-Bouldin Score: {david_bouldin:.4f}")
+
