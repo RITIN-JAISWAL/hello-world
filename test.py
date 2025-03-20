@@ -207,3 +207,87 @@ df_results = pd.DataFrame.from_dict({
 }, orient="index").T
 
 io.save(data=df_results, path=model_artifact.path.replace("_artifact", "_evaluation.csv"))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Register model
+    lineage_client.register_model(
+        algorithm_name="Graph2Vec-UMAP-HDBSCAN",
+        package_name="Graph Embedding & Clustering",
+        **user_dict,
+        **git_dict,
+    )
+
+    # Register best hyperparameters
+    lineage_client.register_parameter(
+        parameter_name="best_graph2vec_dimensions",
+        parameter_value=best_params["graph2vec"]["dimensions"],
+    )
+    
+    lineage_client.register_parameter(
+        parameter_name="best_graph2vec_wl_iterations",
+        parameter_value=best_params["graph2vec"]["wl_iterations"],
+    )
+
+    lineage_client.register_parameter(
+        parameter_name="best_umap_n_components",
+        parameter_value=best_params["umap"]["n_components"],
+    )
+
+    lineage_client.register_parameter(
+        parameter_name="best_umap_min_dist",
+        parameter_value=best_params["umap"]["min_dist"],
+    )
+
+    lineage_client.register_parameter(
+        parameter_name="best_umap_n_neighbors",
+        parameter_value=best_params["umap"]["n_neighbors"],
+    )
+
+    lineage_client.register_parameter(
+        parameter_name="best_hdbscan_min_cluster_size",
+        parameter_value=best_params["hdbscan"]["min_cluster_size"],
+    )
+
+    lineage_client.register_parameter(
+        parameter_name="best_hdbscan_min_samples",
+        parameter_value=best_params["hdbscan"]["min_samples"],
+    )
+
+    lineage_client.register_parameter(
+        parameter_name="best_hdbscan_cluster_selection_epsilon",
+        parameter_value=best_params["hdbscan"]["cluster_selection_epsilon"],
+    )
+
+    # Register model artifact
+    lineage_client.register_model_artifact(
+        artifact_name="best_graph2vec_umap_hdbscan_model",
+        artifact_uri=model_artifact.uri.replace("_artifact", "_best_model.parquet"),
+    )
+
+    lineage_client.register_model_artifact(
+        artifact_name="hyperparameter_tuning_results",
+        artifact_uri=model_artifact.uri.replace("_artifact", "_hyperparam_results.parquet"),
+    )
+
+print("Best parameters found:", best_params)
