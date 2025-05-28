@@ -1,0 +1,84 @@
+Today I’d like to introduce you to our innovative automation solution designed to streamline the onboarding of Terminal IDs—or TIDs—into Siebel, specifically for Worldpay Total (WPT) and FreedomPay. As we know, manual entry of TID data has long been a pain point: it's tedious, error-prone, and highly resource-intensive. Our automated solution dramatically reduces these challenges, saving time, minimizing errors, and enabling our operations team to focus on more critical tasks.
+
+Slide 1: Context and Challenges (1:00–2:30 min)
+Let’s first discuss the context of this initiative. Traditionally, TIDs are received from external parties in the form of CSV files. These files are frequently inconsistent—formats vary, data is incomplete, and human errors are inevitable. This lack of standardization and consistency demands significant manual intervention and leads to potential inaccuracies.
+
+Our solution directly addresses these core problems by automating data ingestion, standardizing fields across various sources, validating uploaded data accurately, and providing clear insights into data quality through dashboards.
+
+An important assumption we have made for clarity is that merchants send us only Delta TIDs—meaning only changes or new TIDs are provided, simplifying the processing logic.
+
+Slide 2: Rule-Based Automation for TID Ingestion (2:30–5:00 min)
+The first major component of our solution is a robust rule-based automation engine which was shown as a part of the demo. This system is built on Python and designed specifically to handle CSV data efficiently, transforming and normalizing it into a consistent format compatible with Siebel and NAP systems.
+
+Let’s look closely at the architecture:
+
+Input: Raw CSV files coming directly from merchants or external providers.
+
+Processing Engine: Python-based, incorporating a set of predefined business rules for validating and cleaning the data.
+
+Output: Structured and verified data ready for API-driven uploads directly into Siebel, either via the Web Services API (SOAP/REST) or through available bulk loaders.
+
+These rules include:
+
+Header Mapping: Ensuring consistency across varying header formats, standardizing fields such as TID, Terminal_ID, TermID into a unified header.
+
+Format Validation: Confirming TIDs match expected formats and lengths.
+
+Serial Matching: TIDs are linked accurately to customer IDs using a lookup table.
+
+Duplicate Checks: Eliminating redundant records.
+
+Location Validation: Ensuring each TID aligns correctly with a verified Siebel location ID.
+
+Sequential Gaps Check: Detecting any unusual gaps or anomalies in sequential data.
+
+Schema Enforcement: Guaranteeing each CSV meets a strict schema including mandatory fields like TID, Customer ID, Location ID, Provider, and Upload Date.
+
+By enforcing these rules, we drastically minimize the manual verification traditionally needed before data ingestion.
+
+Slide 3: GenAI Validator for CSV Quality & Contextual Accuracy (5:00–8:00 min)
+However, rule-based validation alone isn’t enough. This brings us to the second component—our GenAI Validator. This solution leverages advanced Large Language Models (LLMs) to perform deep semantic analysis and structural validation of the TID data.
+
+Here’s how it functions in practice:
+
+Step 1: File Ingestion – CSV files are ingested through LangChain or LlamaIndex libraries for efficient data processing.
+
+Step 2: Prompt Engineering – We enhance context by embedding essential metadata, including merchant names, upload dates, expected headers, and location mappings.
+
+Step 3: LLM Evaluation – Our GenAI Validator analyzes the data contextually, identifying anomalies beyond what static rules detect:
+
+It spots mismatched pairs, such as TIDs incorrectly linked to Serial Numbers.
+
+It detects semantic errors, like swapped Customer IDs and TIDs.
+
+It proactively recommends corrections or highlights specific rows needing human attention.
+
+Step 4: Reporting – It generates clear and actionable reports, summarizing passed and failed rows and providing insightful, human-readable explanations like "Row 53 has an invalid customer ID linked to an inactive location."
+
+The technology stack includes LLMs for deep learning capabilities and Streamlit or QuickSight dashboards, giving operational teams immediate visual insights into data quality.
+
+Slide 4: Benefits and Impact (8:00–9:30 min)
+The combined impact of our rule-based engine and GenAI Validator is transformative. Let’s briefly highlight the major benefits:
+
+Manual Effort Reduction: Manual data processing effort is slashed by over 80%. This directly translates into more time available for strategic initiatives.
+
+Enhanced Accuracy: Combining rule-based logic with GenAI ensures far fewer errors slip through, significantly improving data quality.
+
+Greater Scalability: The system effortlessly manages bulk data uploads from multiple merchants simultaneously.
+
+Improved Compliance: The validation mechanism provides traceability and audit readiness for each batch of TIDs, meeting regulatory and internal compliance needs seamlessly.
+
+Our sample workflow illustrates the streamlined process clearly:
+
+CSV file upload.
+
+Automatic rules-based transformation.
+
+Semantic validation via GenAI.
+
+Automated upload to Siebel/NAP.
+
+Dashboards for transparency on success and failure rates.
+
+Conclusion & Next Steps (9:30–10:00 min)
+In conclusion, our combined automation and GenAI validation solution fundamentally improves the efficiency, accuracy, and scalability of TID onboarding. It frees operational teams from repetitive tasks, significantly reduces errors, and enhances overall data quality, laying a strong foundation for future growth and continuous improvement.
