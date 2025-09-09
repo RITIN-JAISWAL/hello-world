@@ -1,7 +1,7 @@
 import os, re, json, time
 import pandas as pd
 from databricks import sql
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 HOST = os.getenv("DATABRICKS_HOST")
 HTTP_PATH = os.getenv("DATABRICKS_HTTP_PATH")
@@ -13,10 +13,10 @@ SILVER_CATALOG = os.getenv("SILVER_CATALOG_NAME", "sdr_silver_dev")
 SILVER_SCHEMA  = os.getenv("SILVER_SCHEMA_NAME",  "silver_meter_data")
 SILVER_TABLE   = os.getenv("SILVER_TABLE_NAME",   "tbl_meterdata")
 
-_cache: Dict[str, Any] = {"ts": 0, "semantic": None}
-TTL = 25 * 60  # 25 min cache, aligns with ~30 min data refresh
+_cache: Dict[str, Any] = {"ts": 0, "semantic": None, "region_maps": None}
+TTL = 25 * 60  # align with ~30 min data refresh
 
-# ------------------ Core SQL helpers ------------------
+# ---------- SQL helpers ----------
 
 def _connect():
     if not (HOST and HTTP_PATH and TOKEN):
@@ -64,10 +64,9 @@ def _best_col(cols: List[str], patterns: List[str]) -> Optional[str]:
                 return orig
     return None
 
-# ------------------ Semantic inference ------------------
+# ---------- Semantic inference ----------
 
 def infer_semantic_map() -> Dict[str, Any]:
-    """Auto-detect tables/columns once, cache ~25 min."""
     now = time.time()
     if _cache["semantic"] and now - _cache["ts"] < TTL:
         return _cache["semantic"]
@@ -99,18 +98,67 @@ def infer_semantic_map() -> Dict[str, Any]:
             "mpan_col": mpan_col, "period_col": period_col,
         },
     }
-    _cache["ts"], _cache["semantic"] = now, semantic
+    _cache["semantic"], _cache["ts"] = semantic, now
     return semantic
 
 def get_semantic_map_json() -> str:
     return json.dumps(infer_semantic_map(), indent=2)
 
-# ------------------ Query helpers (schema-agnostic) ------------------
+# ---------- Region name ↔ code mapping (from dim_gspgroup) ----------
+
+def _region_maps() -> Tuple[Dict[str, str], Dict[str, List[str]]]:
+    """
+    Returns:
+      code_to_name: {'_A': 'London', ...}
+      name_to_codes: {'London': ['_A'], ...}
+    """
+    now = time.time()
+    if _cache["region_maps"] and now - _cache["ts"] < TTL:
+        return _cache["region_maps"]
+
+    S = infer_semantic_map()
+    code_to_name, name_to_codes = {}, {}
+    if S["gold"]["dim_gspgroup"]:
+        g = f"{S['gold']['catalog']}.{S['gold']['schema']}.{S['gold']['dim_gspgroup']}"
+        try:
+            df = query_df(f"SELECT GSPGroupID, RegionName FROM {g}")
+            for _, r in df.iterrows():
+                code = str(r["GSPGroupID"])
+                name = str(r["RegionName"]) if pd.notna(r["RegionName"]) else code
+                code_to_name[code] = name
+                name_to_codes.setdefault(name, []).append(code)
+        except Exception:
+            pass
+
+    _cache["region_maps"] = (code_to_name, name_to_codes)
+    return _cache["region_maps"]
+
+def _region_predicate(region_input: Optional[str], region_col: Optional[str]) -> str:
+    """Build WHERE predicate allowing either RegionName or code."""
+    if not region_input or not region_col:
+        return ""
+    code_to_name, name_to_codes = _region_maps()
+    if region_input in name_to_codes:
+        codes = name_to_codes[region_input]
+        in_list = ",".join([f"'{c}'" for c in codes])
+        return f" AND {region_col} IN ({in_list})"
+    return f" AND {region_col} = '{region_input}'"
+
+def _apply_friendly_region_names(df: pd.DataFrame, col: str = "region") -> pd.DataFrame:
+    if df.empty or col not in df.columns:
+        return df
+    code_to_name, _ = _region_maps()
+    if not code_to_name:
+        return df
+    # only map where value is a known code
+    return df.assign(region=df[col].map(lambda x: code_to_name.get(str(x), x)))
+
+# ---------- Query helpers (schema-agnostic) ----------
 
 def agg_daily(start_date: str, end_date: str, region: Optional[str] = None) -> pd.DataFrame:
     S = infer_semantic_map()
 
-    # Prefer Gold MV if present (and optionally join dim_gspgroup)
+    # Prefer Gold MV (already uses RegionName when joined)
     if S["gold"]["daily_mv"]:
         mv = f"{S['gold']['catalog']}.{S['gold']['schema']}.{S['gold']['daily_mv']}"
         region_field = "f.GSPGroupID"
@@ -141,8 +189,8 @@ def agg_daily(start_date: str, end_date: str, region: Optional[str] = None) -> p
     d, v, r = s["date_col"], s["value_col"], s["region_col"]
     if not (d and v):
         raise RuntimeError("Could not infer date/value columns from silver table.")
+    region_pred = _region_predicate(region, r)
     reg_sel = f"COALESCE({r}, 'Unknown')" if r else "'All'"
-    region_pred = f" AND {r} = '{region}'" if (region and r) else ""
     q = f"""
     SELECT {d} AS reading_date,
            {reg_sel} AS region,
@@ -152,7 +200,9 @@ def agg_daily(start_date: str, end_date: str, region: Optional[str] = None) -> p
     GROUP BY {d}, {reg_sel}
     ORDER BY reading_date
     """
-    return query_df(q)
+    df = query_df(q)
+    # map region codes to names if possible
+    return _apply_friendly_region_names(df, "region")
 
 def import_export_breakdown(start_date: str, end_date: str, region: Optional[str] = None) -> pd.DataFrame:
     S = infer_semantic_map()
@@ -161,7 +211,7 @@ def import_export_breakdown(start_date: str, end_date: str, region: Optional[str
     d, v, r = s["date_col"], s["value_col"], s["region_col"]
     if not (d and v):
         raise RuntimeError("Could not infer date/value columns from silver table.")
-    region_pred = f" AND {r} = '{region}'" if (region and r) else ""
+    region_pred = _region_predicate(region, r)
     q = f"""
     SELECT CASE WHEN {v} >= 0 THEN 'Import' ELSE 'Export' END AS import_export_flag,
            SUM(ABS({v})) AS kwh_consumed
@@ -178,7 +228,7 @@ def peak_offpeak(start_date: str, end_date: str, region: Optional[str] = None) -
     d, v, r, p = s["date_col"], s["value_col"], s["region_col"], s["period_col"]
     if S["gold"]["dim_halfhour"] and p:
         hh = f"{S['gold']['catalog']}.{S['gold']['schema']}.{S['gold']['dim_halfhour']}"
-        region_pred = f" AND {r} = '{region}'" if (region and r) else ""
+        region_pred = _region_predicate(region, r)
         q = f"""
         SELECT s.{d} AS reading_date,
                SUM(CASE WHEN COALESCE(hh.IsPeak, false) THEN s.{v} ELSE 0 END) AS peak_kwh,
@@ -197,47 +247,48 @@ def peak_offpeak(start_date: str, end_date: str, region: Optional[str] = None) -
     return agg_daily(start_date, end_date, region)[["reading_date"]].assign(peak_kwh=None, offpeak_kwh=None)
 
 def distinct_regions(limit: int = 200) -> List[str]:
-    """Get distinct region/GSP values from Silver (or Gold dim if needed)."""
+    """Prefer friendly names from dim_gspgroup; fallback to silver column values."""
     S = infer_semantic_map()
-    s = S["silver"]
-    r = s["region_col"]
-    if r:
-        fq = f"{s['catalog']}.{s['schema']}.{s['table']}"
-        d = s["date_col"] or "1=1"
-        q = f"""
-        SELECT DISTINCT {r} AS region
-        FROM {fq}
-        WHERE {d} IS NOT NULL
-        ORDER BY region
-        LIMIT {limit}
-        """
-        df = query_df(q)
-        return [x for x in df["region"].astype(str).tolist() if x and x.lower() != "null"]
-    # fallback to Gold dim
+    # Prefer Gold dim to get names
     if S["gold"]["dim_gspgroup"]:
         g = f"{S['gold']['catalog']}.{S['gold']['schema']}.{S['gold']['dim_gspgroup']}"
         try:
             df = query_df(f"SELECT DISTINCT COALESCE(RegionName, GSPGroupID) AS region FROM {g} ORDER BY region LIMIT {limit}")
-            return df["region"].astype(str).tolist()
+            vals = [x for x in df["region"].astype(str).tolist() if x and x.lower() != "null"]
+            return vals
         except Exception:
             pass
+    # Fallback to silver region column
+    s = S["silver"]; r = s["region_col"]
+    if r:
+        fq = f"{s['catalog']}.{s['schema']}.{s['table']}"
+        d = s["date_col"] or "1=1"
+        df = query_df(f"SELECT DISTINCT {r} AS region FROM {fq} WHERE {d} IS NOT NULL ORDER BY region LIMIT {limit}")
+        # map codes to names if we can
+        df = _apply_friendly_region_names(df, "region")
+        return [x for x in df["region"].astype(str).tolist() if x and x.lower() != "null"]
     return []
 
-def totals_by_region(start_date: str, end_date: str, top_n: int = 10) -> pd.DataFrame:
-    df = agg_daily(start_date, end_date, None)
-    if df.empty: return df
+def totals_by_region(start_date: str, end_date: str, top_n: int = 10, region: Optional[str] = None) -> pd.DataFrame:
+    """
+    If region is None -> totals for all regions (Top-N).
+    If region is provided -> returns a single row (selected region total).
+    """
+    df = agg_daily(start_date, end_date, region)
+    if df.empty:
+        return df
     out = df.groupby("region", as_index=False)["total_kwh"].sum().sort_values("total_kwh", ascending=False)
-    return out.head(top_n)
+    return out.head(top_n) if region is None else out
 
 def heatmap_day_period(start_date: str, end_date: str, region: Optional[str] = None) -> pd.DataFrame:
-    """Aggregate by date × settlement period for heatmap (if period column exists)."""
+    """Aggregate by date × settlement period for heatmap (responds to region)."""
     S = infer_semantic_map()
     s = S["silver"]
     d, v, r, p = s["date_col"], s["value_col"], s["region_col"], s["period_col"]
     if not (d and v and p):
         return pd.DataFrame(columns=["reading_date", "period", "kwh"])
     fq = f"{s['catalog']}.{s['schema']}.{s['table']}"
-    region_pred = f" AND {r} = '{region}'" if (region and r) else ""
+    region_pred = _region_predicate(region, r)
     q = f"""
     SELECT {d} AS reading_date, {p} AS period, SUM({v}) AS kwh
     FROM {fq}
@@ -254,7 +305,7 @@ def distinct_mpan_count(start_date: str, end_date: str, region: Optional[str] = 
         return None
     fq = f"{s['catalog']}.{s['schema']}.{s['table']}"
     d, r, m = s["date_col"], s["region_col"], s["mpan_col"]
-    region_pred = f" AND {r} = '{region}'" if (region and r) else ""
+    region_pred = _region_predicate(region, r)
     q = f"""
     SELECT COUNT(DISTINCT {m}) AS mpan_cnt
     FROM {fq}

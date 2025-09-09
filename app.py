@@ -5,7 +5,6 @@ load_dotenv()
 
 import streamlit as st
 import pandas as pd
-import plotly.express as px
 
 from langchain_core.messages import HumanMessage, AIMessage
 
@@ -16,27 +15,72 @@ from src.charts.utils import (
     pie_import_export, heatmap_period
 )
 
-# ---------- Page ----------
+# -------------------- Page & Theme --------------------
 st.set_page_config(page_title="Metering Agentic POC", layout="wide")
-st.title("⚡ Metering Agentic AI – Settlement POC")
-st.caption("Gold: sdr_gold_dev.meter_data • Silver: sdr_silver_dev.silver_meter_data.tbl_meterdata")
 
-# ---------- Filters (with Region dropdown) ----------
+st.markdown("""
+<style>
+/* Blue header block */
+.header-block {
+  background:#0b3d91;        /* deep blue */
+  color:#ffffff;
+  padding:18px 22px;
+  border-radius:16px;
+  margin-bottom:14px;
+}
+.header-block h1 {
+  color:#ffffff !important;
+  margin:0; font-weight:800; line-height:1.15; font-size:28px;
+}
+
+/* Cards */
+.card {
+  background:#ffffff;
+  border:1px solid #e9ecef;
+  border-radius:16px;
+  padding:16px;
+  box-shadow:0 6px 18px rgba(0,0,0,0.06);
+  margin-bottom:16px;
+}
+
+/* Highlights */
+.kpi-title { font-size:14px; color:#6c757d; text-transform:uppercase; letter-spacing:.08em; margin-bottom:6px; }
+.kpi-number { font-size:34px; font-weight:800; margin-bottom:2px; }
+.kpi-sub { color:#6c757d; font-size:12px; }
+
+/* Nicer select/input spacing inside cards */
+.block .stSelectbox, .block .stDateInput, .block .stButton { margin-top:6px; }
+</style>
+""", unsafe_allow_html=True)
+
+# -------------------- Header (blue) --------------------
+st.markdown("""
+<div class="header-block">
+  <h1>Metering Agentic AI – Settlement POC</h1>
+  <div>Gold: <code>sdr_gold_dev.meter_data</code> • Silver: <code>sdr_silver_dev.silver_meter_data.tbl_meterdata</code></div>
+</div>
+""", unsafe_allow_html=True)
+
+# -------------------- Filters --------------------
 region_list = ["All Regions"] + dbx.distinct_regions()
-c1, c2, c3, c4 = st.columns([1,1,2,1])
-with c1:
-    start = st.date_input("Start date", value=date.today() - timedelta(days=30))
-with c2:
-    end = st.date_input("End date", value=date.today())
-with c3:
-    region_choice = st.selectbox("Region / GSP", options=region_list, index=0)
-    region = None if region_choice == "All Regions" else region_choice
-with c4:
-    if st.button("Refresh data"):
-        for k in ("daily_df", "pp_df", "totals_df", "heat_df"):
-            st.session_state.pop(k, None)
 
-# ---------- Data pulls ----------
+with st.container():
+    st.markdown('<div class="card block">', unsafe_allow_html=True)
+    c1, c2, c3, c4 = st.columns([1,1,2,1])
+    with c1:
+        start = st.date_input("Start date", value=date.today() - timedelta(days=30))
+    with c2:
+        end = st.date_input("End date", value=date.today())
+    with c3:
+        region_choice = st.selectbox("Region / GSP", options=region_list, index=0)
+        region = None if region_choice == "All Regions" else region_choice
+    with c4:
+        if st.button("Refresh data"):
+            for k in ("daily_df", "pp_df", "totals_df", "heat_df"):
+                st.session_state.pop(k, None)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+# -------------------- Data fetch --------------------
 def load_daily():
     return dbx.agg_daily(start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"), region)
 
@@ -52,7 +96,10 @@ if daily_df is None:
 totals_df = st.session_state.get("totals_df")
 if totals_df is None:
     try:
-        totals_df = dbx.totals_by_region(start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"), top_n=12)
+        totals_df = dbx.totals_by_region(
+            start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"),
+            top_n=12, region=region
+        )
         st.session_state["totals_df"] = totals_df
     except Exception:
         totals_df = pd.DataFrame()
@@ -60,7 +107,10 @@ if totals_df is None:
 heat_df = st.session_state.get("heat_df")
 if heat_df is None:
     try:
-        heat_df = dbx.heatmap_day_period(start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"), region)
+        heat_df = dbx.heatmap_day_period(
+            start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"),
+            region
+        )
         st.session_state["heat_df"] = heat_df
     except Exception:
         heat_df = pd.DataFrame()
@@ -68,70 +118,81 @@ if heat_df is None:
 # KPIs
 total_kwh = float(daily_df["total_kwh"].sum()) if not daily_df.empty else 0.0
 mpans = dbx.distinct_mpan_count(start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"), region)
+days = daily_df["reading_date"].nunique() if not daily_df.empty else 0
+regions_in_view = daily_df["region"].nunique() if not daily_df.empty else 0
 
-k1, k2, k3, k4 = st.columns(4)
-k1.metric("Total kWh", f"{total_kwh:,.0f}")
-k2.metric("Days", f"{daily_df['reading_date'].nunique() if not daily_df.empty else 0}")
-k3.metric("Regions in view", f"{daily_df['region'].nunique() if not daily_df.empty else 0}")
-k4.metric("#MPANs", f"{mpans:,}" if mpans is not None else "N/A")
+# -------------------- Highlights (consumption + KPIs) --------------------
+with st.container():
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("### Highlights")
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        st.markdown('<div class="kpi-title">Total Consumption</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="kpi-number">{total_kwh:,.0f}</div>', unsafe_allow_html=True)
+        st.markdown('<div class="kpi-sub">kWh</div>', unsafe_allow_html=True)
+    with k2:
+        st.markdown('<div class="kpi-title">Days</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="kpi-number">{days}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="kpi-sub">{start} → {end}</div>', unsafe_allow_html=True)
+    with k3:
+        st.markdown('<div class="kpi-title">Regions in view</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="kpi-number">{regions_in_view}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="kpi-sub">{region_choice}</div>', unsafe_allow_html=True)
+    with k4:
+        st.markdown('<div class="kpi-title"># MPANs</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="kpi-number">{mpans:,}</div>' if mpans is not None else '<div class="kpi-number">N/A</div>', unsafe_allow_html=True)
+        st.markdown('<div class="kpi-sub">distinct</div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
 
-# ---------- Charts row 1 ----------
-c1, c2 = st.columns([2,1])
-with c1:
-    if not daily_df.empty:
-        # show stacked area if many regions; else line
-        if daily_df["region"].nunique() > 3:
-            st.plotly_chart(area_stacked(daily_df), use_container_width=True, theme=None)
+# -------------------- Charts (all in ONE block) --------------------
+with st.container():
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("### Charts")
+
+    # Row 1: time-series + import/export
+    r1c1, r1c2 = st.columns([2,1])
+    with r1c1:
+        if not daily_df.empty:
+            if daily_df["region"].nunique() > 3:
+                st.plotly_chart(area_stacked(daily_df), use_container_width=True, theme=None)
+            else:
+                st.plotly_chart(line_consumption(daily_df), use_container_width=True, theme=None)
         else:
-            st.plotly_chart(line_consumption(daily_df), use_container_width=True, theme=None)
-    else:
-        st.info("No data for selected filters.")
+            st.info("No data for selected filters.")
+    with r1c2:
+        try:
+            pie_df = dbx.import_export_breakdown(
+                start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"), region
+            )
+            if not pie_df.empty:
+                st.plotly_chart(pie_import_export(pie_df), use_container_width=True, theme=None)
+            else:
+                st.info("No import/export rows.")
+        except Exception:
+            st.warning("Import/Export pie unavailable.")
 
-with c2:
-    try:
-        pie_df = dbx.import_export_breakdown(
-            start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"), region
-        )
-        if not pie_df.empty:
-            st.plotly_chart(pie_import_export(pie_df), use_container_width=True, theme=None)
+    # Row 2: Top regions + heatmap
+    r2c1, r2c2 = st.columns([1,1])
+    with r2c1:
+        if not totals_df.empty:
+            st.subheader("Totals (kWh)" if region else "Top regions (total kWh)")
+            st.plotly_chart(bar_top_regions(totals_df), use_container_width=True, theme=None)
         else:
-            st.info("No import/export rows.")
-    except Exception:
-        st.warning("Import/Export pie unavailable.")
+            st.info("No region totals.")
+    with r2c2:
+        if not heat_df.empty:
+            st.subheader("Period heatmap")
+            st.plotly_chart(heatmap_period(heat_df), use_container_width=True, theme=None)
+        else:
+            st.info("No period grain available for heatmap.")
 
-# ---------- Charts row 2 ----------
-c3, c4 = st.columns([1,1])
-with c3:
-    if not totals_df.empty:
-        st.subheader("Top regions (total kWh)")
-        st.plotly_chart(bar_top_regions(totals_df), use_container_width=True, theme=None)
-    else:
-        st.info("No region totals.")
+    st.markdown('</div>', unsafe_allow_html=True)
 
-with c4:
-    if not heat_df.empty:
-        st.subheader("Period heatmap")
-        st.plotly_chart(heatmap_period(heat_df), use_container_width=True, theme=None)
-    else:
-        st.info("No period grain available for heatmap.")
-
-st.divider()
-
-# ---------- Chat (fixed to use LangChain Messages) ----------
+# -------------------- Chat --------------------
+st.markdown('<div class="card">', unsafe_allow_html=True)
 st.subheader("Chat with your data")
 agent = build_agent()
 
-# Quick suggestions
-sg = st.container()
-b1, b2, b3 = sg.columns(3)
-if b1.button("What regions are there?"):
-    st.session_state.setdefault("queued_prompt", "List distinct regions available.")
-if b2.button("Predict the target kWh for London for the month of July"):
-    st.session_state.setdefault("queued_prompt", "Predict the target kWh for London for July this year.")
-if b3.button("Peak vs off-peak last 14 days"):
-    st.session_state.setdefault("queued_prompt", "Show peak vs off-peak for last 14 days for all regions.")
-
-# Message history as LangChain objects
 if "lc_messages" not in st.session_state:
     st.session_state["lc_messages"] = []
 
@@ -140,21 +201,17 @@ for m in st.session_state["lc_messages"]:
     st.chat_message(role).markdown(m.content)
 
 prompt = st.chat_input("Ask e.g. 'Predict next month for London' or 'Peak vs off-peak last 14 days'")
-if st.session_state.get("queued_prompt"):
-    prompt = st.session_state.pop("queued_prompt")
-
 if prompt:
     st.session_state["lc_messages"].append(HumanMessage(content=prompt))
     st.chat_message("user").markdown(prompt)
-
     try:
         result = agent.invoke({"messages": st.session_state["lc_messages"]})
         ai_msg = result["messages"][-1]
         content = ai_msg.content if hasattr(ai_msg, "content") else str(ai_msg)
     except Exception as e:
         content = f"Error: {e}"
-
     st.session_state["lc_messages"].append(AIMessage(content=content))
     st.chat_message("assistant").markdown(content)
+st.markdown('</div>', unsafe_allow_html=True)
 
-st.caption("Agent tools: schema_map, daily_consumption, peak_offpeak, predict_month • Auto schema discovery • Azure OpenAI")
+st.caption("Region names resolved via dim_gspgroup • All charts respond to Region filter • Auto schema discovery • Azure OpenAI")
