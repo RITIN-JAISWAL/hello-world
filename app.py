@@ -5,7 +5,6 @@ load_dotenv()
 
 import streamlit as st
 import pandas as pd
-
 from langchain_core.messages import HumanMessage, AIMessage
 
 from src.agents.energy_agent import build_agent
@@ -15,45 +14,21 @@ from src.charts.utils import (
     pie_import_export, heatmap_period
 )
 
-# -------------------- Page & Theme --------------------
 st.set_page_config(page_title="Metering Agentic POC", layout="wide")
 
+# ---------- Styles ----------
 st.markdown("""
 <style>
-/* Blue header block */
-.header-block {
-  background:#0b3d91;        /* deep blue */
-  color:#ffffff;
-  padding:18px 22px;
-  border-radius:16px;
-  margin-bottom:14px;
-}
-.header-block h1 {
-  color:#ffffff !important;
-  margin:0; font-weight:800; line-height:1.15; font-size:28px;
-}
-
-/* Cards */
-.card {
-  background:#ffffff;
-  border:1px solid #e9ecef;
-  border-radius:16px;
-  padding:16px;
-  box-shadow:0 6px 18px rgba(0,0,0,0.06);
-  margin-bottom:16px;
-}
-
-/* Highlights */
+.header-block { background:#0b3d91; color:#fff; padding:18px 22px; border-radius:16px; margin-bottom:14px; }
+.header-block h1 { color:#fff !important; margin:0; font-weight:800; font-size:28px; line-height:1.15; }
+.card { background:#fff; border:1px solid #e9ecef; border-radius:16px; padding:16px; box-shadow:0 6px 18px rgba(0,0,0,.06); margin-bottom:16px; }
 .kpi-title { font-size:14px; color:#6c757d; text-transform:uppercase; letter-spacing:.08em; margin-bottom:6px; }
 .kpi-number { font-size:34px; font-weight:800; margin-bottom:2px; }
 .kpi-sub { color:#6c757d; font-size:12px; }
-
-/* Nicer select/input spacing inside cards */
-.block .stSelectbox, .block .stDateInput, .block .stButton { margin-top:6px; }
 </style>
 """, unsafe_allow_html=True)
 
-# -------------------- Header (blue) --------------------
+# ---------- Header ----------
 st.markdown("""
 <div class="header-block">
   <h1>Metering Agentic AI – Settlement POC</h1>
@@ -61,12 +36,11 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# -------------------- Filters --------------------
+# ---------- Filters ----------
 region_list = ["All Regions"] + dbx.distinct_regions()
-
 with st.container():
-    st.markdown('<div class="card block">', unsafe_allow_html=True)
-    c1, c2, c3, c4 = st.columns([1,1,2,1])
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    c1, c2, c3 = st.columns([1,1,2])
     with c1:
         start = st.date_input("Start date", value=date.today() - timedelta(days=30))
     with c2:
@@ -74,54 +48,22 @@ with st.container():
     with c3:
         region_choice = st.selectbox("Region / GSP", options=region_list, index=0)
         region = None if region_choice == "All Regions" else region_choice
-    with c4:
-        if st.button("Refresh data"):
-            for k in ("daily_df", "pp_df", "totals_df", "heat_df"):
-                st.session_state.pop(k, None)
     st.markdown('</div>', unsafe_allow_html=True)
 
-# -------------------- Data fetch --------------------
-def load_daily():
-    return dbx.agg_daily(start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"), region)
+# ---------- Data pulls (no caching; always reflect UI) ----------
+def dstr(d: date) -> str: return d.strftime("%Y-%m-%d")
 
-daily_df = st.session_state.get("daily_df")
-if daily_df is None:
-    try:
-        daily_df = load_daily()
-        st.session_state["daily_df"] = daily_df
-    except Exception as e:
-        st.error(f"Failed to pull daily consumption. {e}")
-        daily_df = pd.DataFrame(columns=["reading_date","region","total_kwh"])
+daily_df = dbx.agg_daily(dstr(start), dstr(end), region)
+totals_df = dbx.totals_by_region(dstr(start), dstr(end), top_n=12, region=region)
+heat_df = dbx.heatmap_day_period(dstr(start), dstr(end), region)
+pie_df = dbx.import_export_breakdown(dstr(start), dstr(end), region)
 
-totals_df = st.session_state.get("totals_df")
-if totals_df is None:
-    try:
-        totals_df = dbx.totals_by_region(
-            start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"),
-            top_n=12, region=region
-        )
-        st.session_state["totals_df"] = totals_df
-    except Exception:
-        totals_df = pd.DataFrame()
-
-heat_df = st.session_state.get("heat_df")
-if heat_df is None:
-    try:
-        heat_df = dbx.heatmap_day_period(
-            start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"),
-            region
-        )
-        st.session_state["heat_df"] = heat_df
-    except Exception:
-        heat_df = pd.DataFrame()
-
-# KPIs
 total_kwh = float(daily_df["total_kwh"].sum()) if not daily_df.empty else 0.0
-mpans = dbx.distinct_mpan_count(start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"), region)
+mpans = dbx.distinct_mpan_count(dstr(start), dstr(end), region)
 days = daily_df["reading_date"].nunique() if not daily_df.empty else 0
 regions_in_view = daily_df["region"].nunique() if not daily_df.empty else 0
 
-# -------------------- Highlights (consumption + KPIs) --------------------
+# ---------- Highlights ----------
 with st.container():
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown("### Highlights")
@@ -144,12 +86,11 @@ with st.container():
         st.markdown('<div class="kpi-sub">distinct</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
-# -------------------- Charts (all in ONE block) --------------------
+# ---------- Charts (single block) ----------
 with st.container():
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown("### Charts")
 
-    # Row 1: time-series + import/export
     r1c1, r1c2 = st.columns([2,1])
     with r1c1:
         if not daily_df.empty:
@@ -160,18 +101,11 @@ with st.container():
         else:
             st.info("No data for selected filters.")
     with r1c2:
-        try:
-            pie_df = dbx.import_export_breakdown(
-                start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"), region
-            )
-            if not pie_df.empty:
-                st.plotly_chart(pie_import_export(pie_df), use_container_width=True, theme=None)
-            else:
-                st.info("No import/export rows.")
-        except Exception:
-            st.warning("Import/Export pie unavailable.")
+        if not pie_df.empty:
+            st.plotly_chart(pie_import_export(pie_df), use_container_width=True, theme=None)
+        else:
+            st.info("No import/export rows.")
 
-    # Row 2: Top regions + heatmap
     r2c1, r2c2 = st.columns([1,1])
     with r2c1:
         if not totals_df.empty:
@@ -185,10 +119,9 @@ with st.container():
             st.plotly_chart(heatmap_period(heat_df), use_container_width=True, theme=None)
         else:
             st.info("No period grain available for heatmap.")
-
     st.markdown('</div>', unsafe_allow_html=True)
 
-# -------------------- Chat --------------------
+# ---------- Chat ----------
 st.markdown('<div class="card">', unsafe_allow_html=True)
 st.subheader("Chat with your data")
 agent = build_agent()
@@ -214,4 +147,4 @@ if prompt:
     st.chat_message("assistant").markdown(content)
 st.markdown('</div>', unsafe_allow_html=True)
 
-st.caption("Region names resolved via dim_gspgroup • All charts respond to Region filter • Auto schema discovery • Azure OpenAI")
+st.caption("Auto schema discovery • Uses ALL gold tables via information_schema • Region names resolved from dim_gspgroup • Filters drive every chart")
