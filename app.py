@@ -1,3 +1,4 @@
+# app.py
 import os
 from datetime import date, timedelta
 from dotenv import load_dotenv
@@ -7,28 +8,53 @@ import streamlit as st
 import pandas as pd
 from langchain_core.messages import HumanMessage, AIMessage
 
+# our code
 from src.agents.energy_agent import build_agent
 from src.data_access import dbx
 from src.charts.utils import (
-    line_consumption, area_stacked, bar_top_regions,
-    pie_import_export, heatmap_period
+    line_consumption,
+    area_stacked,
+    bar_top_regions,
+    donut_voltage,      # NEW: voltage donut
+    heatmap_period,
 )
 
+# -------------------- Page & Styles --------------------
 st.set_page_config(page_title="Metering Agentic POC", layout="wide")
 
-# ---------- Styles ----------
 st.markdown("""
 <style>
-.header-block { background:#0b3d91; color:#fff; padding:18px 22px; border-radius:16px; margin-bottom:14px; }
-.header-block h1 { color:#fff !important; margin:0; font-weight:800; font-size:28px; line-height:1.15; }
-.card { background:#fff; border:1px solid #e9ecef; border-radius:16px; padding:16px; box-shadow:0 6px 18px rgba(0,0,0,.06); margin-bottom:16px; }
+/* Blue header block */
+.header-block {
+  background:#0b3d91;
+  color:#ffffff;
+  padding:18px 22px;
+  border-radius:16px;
+  margin-bottom:14px;
+}
+.header-block h1 {
+  color:#ffffff !important;
+  margin:0; font-weight:800; line-height:1.15; font-size:28px;
+}
+
+/* Cards */
+.card {
+  background:#ffffff;
+  border:1px solid #e9ecef;
+  border-radius:16px;
+  padding:16px;
+  box-shadow:0 6px 18px rgba(0,0,0,0.06);
+  margin-bottom:16px;
+}
+
+/* Highlights */
 .kpi-title { font-size:14px; color:#6c757d; text-transform:uppercase; letter-spacing:.08em; margin-bottom:6px; }
 .kpi-number { font-size:34px; font-weight:800; margin-bottom:2px; }
 .kpi-sub { color:#6c757d; font-size:12px; }
 </style>
 """, unsafe_allow_html=True)
 
-# ---------- Header ----------
+# -------------------- Header --------------------
 st.markdown("""
 <div class="header-block">
   <h1>Metering Agentic AI – Settlement POC</h1>
@@ -36,8 +62,8 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# ---------- Filters ----------
-region_list = ["All Regions"] + dbx.distinct_regions()
+# -------------------- Filters --------------------
+region_options = ["All Regions"] + dbx.distinct_regions()
 with st.container():
     st.markdown('<div class="card">', unsafe_allow_html=True)
     c1, c2, c3 = st.columns([1,1,2])
@@ -46,24 +72,28 @@ with st.container():
     with c2:
         end = st.date_input("End date", value=date.today())
     with c3:
-        region_choice = st.selectbox("Region / GSP", options=region_list, index=0)
+        region_choice = st.selectbox("Region / GSP", options=region_options, index=0)
         region = None if region_choice == "All Regions" else region_choice
     st.markdown('</div>', unsafe_allow_html=True)
 
-# ---------- Data pulls (no caching; always reflect UI) ----------
-def dstr(d: date) -> str: return d.strftime("%Y-%m-%d")
+# -------------------- Data pulls (always reflect filters) --------------------
+def dstr(d: date) -> str:
+    return d.strftime("%Y-%m-%d")
 
-daily_df = dbx.agg_daily(dstr(start), dstr(end), region)
-totals_df = dbx.totals_by_region(dstr(start), dstr(end), top_n=12, region=region)
-heat_df = dbx.heatmap_day_period(dstr(start), dstr(end), region)
-pie_df = dbx.import_export_breakdown(dstr(start), dstr(end), region)
+start_s, end_s = dstr(start), dstr(end)
 
-total_kwh = float(daily_df["total_kwh"].sum()) if not daily_df.empty else 0.0
-mpans = dbx.distinct_mpan_count(dstr(start), dstr(end), region)
-days = daily_df["reading_date"].nunique() if not daily_df.empty else 0
+daily_df   = dbx.agg_daily(start_s, end_s, region)
+totals_df  = dbx.totals_by_region(start_s, end_s, top_n=12, region=region)
+heat_df    = dbx.heatmap_day_period(start_s, end_s, region)
+voltage_df = dbx.voltage_breakdown(start_s, end_s, region)
+
+# KPIs
+total_kwh       = float(daily_df["total_kwh"].sum()) if not daily_df.empty else 0.0
+days_in_window  = daily_df["reading_date"].nunique() if not daily_df.empty else 0
 regions_in_view = daily_df["region"].nunique() if not daily_df.empty else 0
+mpans           = dbx.distinct_mpan_count(start_s, end_s, region)
 
-# ---------- Highlights ----------
+# -------------------- Highlights --------------------
 with st.container():
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown("### Highlights")
@@ -74,23 +104,27 @@ with st.container():
         st.markdown('<div class="kpi-sub">kWh</div>', unsafe_allow_html=True)
     with k2:
         st.markdown('<div class="kpi-title">Days</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="kpi-number">{days}</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="kpi-sub">{start} → {end}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="kpi-number">{days_in_window}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="kpi-sub">{start_s} → {end_s}</div>', unsafe_allow_html=True)
     with k3:
         st.markdown('<div class="kpi-title">Regions in view</div>', unsafe_allow_html=True)
         st.markdown(f'<div class="kpi-number">{regions_in_view}</div>', unsafe_allow_html=True)
         st.markdown(f'<div class="kpi-sub">{region_choice}</div>', unsafe_allow_html=True)
     with k4:
         st.markdown('<div class="kpi-title"># MPANs</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="kpi-number">{mpans:,}</div>' if mpans is not None else '<div class="kpi-number">N/A</div>', unsafe_allow_html=True)
+        if mpans is not None:
+            st.markdown(f'<div class="kpi-number">{mpans:,}</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="kpi-number">N/A</div>', unsafe_allow_html=True)
         st.markdown('<div class="kpi-sub">distinct</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
-# ---------- Charts (single block) ----------
+# -------------------- Charts (all in one block) --------------------
 with st.container():
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown("### Charts")
 
+    # Row 1: time-series + voltage donut
     r1c1, r1c2 = st.columns([2,1])
     with r1c1:
         if not daily_df.empty:
@@ -101,11 +135,13 @@ with st.container():
         else:
             st.info("No data for selected filters.")
     with r1c2:
-        if not pie_df.empty:
-            st.plotly_chart(pie_import_export(pie_df), use_container_width=True, theme=None)
+        if not voltage_df.empty:
+            st.subheader("Voltage mix")
+            st.plotly_chart(donut_voltage(voltage_df), use_container_width=True, theme=None)
         else:
-            st.info("No import/export rows.")
+            st.info("No voltage/connection-type data.")
 
+    # Row 2: Top regions + heatmap (both respond to Region filter)
     r2c1, r2c2 = st.columns([1,1])
     with r2c1:
         if not totals_df.empty:
@@ -121,7 +157,7 @@ with st.container():
             st.info("No period grain available for heatmap.")
     st.markdown('</div>', unsafe_allow_html=True)
 
-# ---------- Chat ----------
+# -------------------- Chat (agentic) --------------------
 st.markdown('<div class="card">', unsafe_allow_html=True)
 st.subheader("Chat with your data")
 agent = build_agent()
@@ -129,10 +165,12 @@ agent = build_agent()
 if "lc_messages" not in st.session_state:
     st.session_state["lc_messages"] = []
 
+# show history
 for m in st.session_state["lc_messages"]:
     role = "user" if isinstance(m, HumanMessage) else "assistant"
     st.chat_message(role).markdown(m.content)
 
+# input
 prompt = st.chat_input("Ask e.g. 'Predict next month for London' or 'Peak vs off-peak last 14 days'")
 if prompt:
     st.session_state["lc_messages"].append(HumanMessage(content=prompt))
@@ -147,4 +185,4 @@ if prompt:
     st.chat_message("assistant").markdown(content)
 st.markdown('</div>', unsafe_allow_html=True)
 
-st.caption("Auto schema discovery • Uses ALL gold tables via information_schema • Region names resolved from dim_gspgroup • Filters drive every chart")
+st.caption("Auto schema discovery • Region names via Gold view • Filters drive every chart • Voltage donut replaces Import/Export pie")
