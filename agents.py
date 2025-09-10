@@ -1,116 +1,133 @@
-import os, json, datetime as dt
-from calendar import monthrange
-from typing import Dict, Any
-import pandas as pd
+# src/agents/energy_agent.py
+"""
+SimpleEnergyAgent:
+A lightweight, dependency-free chat layer that understands a few intents
+and uses src.data_access.dbx to answer with real numbers.
 
-from langgraph.graph import MessagesState, StateGraph
-from langchain_core.tools import tool
-from langchain_openai import AzureChatOpenAI
-from sklearn.linear_model import LinearRegression
+Understands:
+- "kwh"/"consumption" (sum) for a region or all regions
+- basic time windows: "this month", "last month", "last 7/14/30 days"
+- "predict next month" (naive forecast = mean of last 3 months)
+
+If a region is not found in the prompt, it falls back to the Region
+filter selected in the UI (passed into answer()).
+"""
+import re
+from datetime import date, timedelta
+import pandas as pd
 
 from src.data_access import dbx
 
 
-def _llm() -> AzureChatOpenAI:
-    """Instantiate Azure OpenAI chat model (no OPENAI_API_KEY needed)."""
-    return AzureChatOpenAI(
-        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-        api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-        api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-08-01-preview"),
-        deployment_name=os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT")
-        or os.getenv("AZURE_OPENAI_DEPLOYMENT"),
-        temperature=0.2,
-    )
+def _best_region_from_prompt(prompt: str) -> str | None:
+    p = prompt.lower()
+    regions = dbx.distinct_regions()
+    # try exact or contained match (case-insensitive)
+    for r in regions:
+        rn = r.strip()
+        if not rn:
+            continue
+        if rn.lower() in p:
+            return rn
+    return None
 
 
-# ------------------------- Tools -------------------------
-
-@tool
-def schema_map(_: Dict[str, Any]) -> str:
-    """Return the auto-inferred semantic map (tables/columns) as JSON, discovered from Unity Catalog's information_schema."""
-    return dbx.get_semantic_map_json()
-
-
-@tool
-def daily_consumption(params: Dict[str, Any]) -> str:
-    """Return daily total kWh between dates (region optional).
-    Params:
-      - start_date: YYYY-MM-DD
-      - end_date:   YYYY-MM-DD
-      - region:     (optional) region/GSP identifier
+def _parse_window(prompt: str, today: date) -> tuple[str, str, bool]:
     """
-    df = dbx.agg_daily(params["start_date"], params["end_date"], params.get("region"))
-    return df.to_json(orient="records")
-
-
-@tool
-def peak_offpeak(params: Dict[str, Any]) -> str:
-    """Return peak vs off-peak kWh per day (joins dim_halfhour if available).
-    Params:
-      - start_date: YYYY-MM-DD
-      - end_date:   YYYY-MM-DD
-      - region:     (optional) region/GSP identifier
+    Returns (start_iso, end_iso, is_forecast) where is_forecast means "predict next month".
     """
-    df = dbx.peak_offpeak(params["start_date"], params["end_date"], params.get("region"))
-    return df.to_json(orient="records")
+    p = prompt.lower()
+    # Predict next month
+    if "predict" in p or "forecast" in p:
+        if "next month" in p or "nextmonth" in p:
+            # we'll compute last 3 finished months and forecast the NEXT month
+            # caller will ignore start/end and pass a larger history window
+            return ("", "", True)
+
+    # This month
+    if "this month" in p:
+        start = today.replace(day=1)
+        return (start.isoformat(), today.isoformat(), False)
+
+    # Last month
+    if "last month" in p:
+        first_this = today.replace(day=1)
+        last_month_end = first_this - timedelta(days=1)
+        last_month_start = last_month_end.replace(day=1)
+        return (last_month_start.isoformat(), last_month_end.isoformat(), False)
+
+    # last N days
+    m = re.search(r"last\s+(\d+)\s*days?", p)
+    if m:
+        n = int(m.group(1))
+        start = today - timedelta(days=n)
+        return (start.isoformat(), today.isoformat(), False)
+
+    # default (UI window)
+    return ("", "", False)
 
 
-@tool
-def predict_month(params: Dict[str, Any]) -> str:
-    """Predict this and next month total kWh for an optional region using a simple linear model over the last ~180 days.
-    Params:
-      - region: (optional) region/GSP identifier
-    """
-    region = params.get("region")
+class SimpleEnergyAgent:
+    """Stateless helper; Streamlit keeps the chat history UI-side."""
 
-    end = dt.date.today()
-    start = end - dt.timedelta(days=180)
-    hist = dbx.agg_daily(start.isoformat(), end.isoformat(), region)
-    if hist.empty:
-        return json.dumps({"error": "no data"})
+    def answer(self, prompt: str, ui_start_iso: str, ui_end_iso: str, ui_region: str | None) -> str:
+        today = date.today()
 
-    hist["reading_date"] = pd.to_datetime(hist["reading_date"])
-    hist = hist.sort_values("reading_date")
+        region = _best_region_from_prompt(prompt) or ui_region
+        start_iso, end_iso, is_forecast = _parse_window(prompt, today)
 
-    X = (hist["reading_date"] - hist["reading_date"].min()).dt.days.values.reshape(-1, 1)
-    y = hist["total_kwh"].values
-    model = LinearRegression().fit(X, y)
+        # Resolve default window to the UI selection
+        start_iso = start_iso or ui_start_iso
+        end_iso = end_iso or ui_end_iso
 
-    def month_sum(y0: int, m0: int) -> float:
-        d0 = pd.Timestamp(year=y0, month=m0, day=1)
-        days = d0.days_in_month
-        rng = pd.date_range(d0, periods=days, freq="D")
-        Xf = ((rng - hist["reading_date"].min()).days.values).reshape(-1, 1)
-        return float(model.predict(Xf).sum())
+        # CONSUMPTION total?
+        if any(k in prompt.lower() for k in ["kwh", "consumption", "total"]):
+            # forecast branch
+            if is_forecast:
+                # get ~180 days history to build a monthly series
+                hist_start = (today.replace(day=1) - timedelta(days=120)).isoformat()
+                hist_end = ui_end_iso
+                df = dbx.agg_daily(hist_start, hist_end, region)
+                if df.empty:
+                    return "I couldn't find enough history to forecast next month."
+                s = (
+                    df.assign(reading_date=pd.to_datetime(df["reading_date"]))
+                      .set_index("reading_date")["total_kwh"]
+                      .resample("MS").sum()  # monthly start
+                )
+                if len(s) < 3:
+                    return "Not enough complete months to build a forecast."
+                # naive forecast: mean of last 3 complete months
+                last_complete = s.index.max()
+                s3 = s[s.index <= last_complete].tail(3)
+                pred = float(s3.mean())
+                next_month = (last_complete + pd.offsets.MonthBegin(1)).strftime("%B %Y")
+                scope = region or "All regions"
+                return f"**Forecast** for {scope} in {next_month}: **{pred:,.0f} kWh** (mean of last 3 months)."
 
-    today = pd.Timestamp.today()
-    this_total = month_sum(today.year, today.month)
-    nm = today + pd.offsets.MonthBegin(1)
-    next_total = month_sum(nm.year, nm.month)
+            # factual total for a window
+            df = dbx.agg_daily(start_iso, end_iso, region)
+            total = float(df["total_kwh"].sum()) if not df.empty else 0.0
+            scope = region or "All regions"
+            return f"Total consumption for **{scope}** from **{start_iso}** to **{end_iso}** is **{total:,.0f} kWh**."
 
-    return json.dumps({
-        "region": region,
-        "this_month_est_kwh": round(this_total, 2),
-        "next_month_est_kwh": round(next_total, 2),
-        "trend": "up" if next_total > this_total else "down" if next_total < this_total else "flat",
-    })
+        # Peak vs Off-peak?
+        if "peak" in prompt.lower():
+            df = dbx.peak_offpeak(start_iso, end_iso, region)
+            if df.empty or df["peak_kwh"].isna().all():
+                return "Peak vs Off-peak breakdown isn't available in the underlying dimensions."
+            pk = float(df["peak_kwh"].sum())
+            op = float(df["offpeak_kwh"].sum())
+            scope = region or "All regions"
+            return f"**Peak**: {pk:,.0f} kWh, **Off-peak**: {op:,.0f} kWh for **{scope}** between {start_iso} and {end_iso}."
 
+        # Regions list?
+        if "what regions" in prompt.lower() or "list regions" in prompt.lower():
+            regs = dbx.distinct_regions()
+            return "Available regions: " + ", ".join(regs)
 
-TOOLS = [schema_map, daily_consumption, peak_offpeak, predict_month]
-
-
-def build_agent():
-    """LangGraph agent that routes between LLM and tools."""
-    llm = _llm().bind_tools(TOOLS)
-    graph = StateGraph(MessagesState)
-
-    def call_llm(state: MessagesState):
-        out = llm.invoke(state["messages"])
-        return {"messages": [out]}
-
-    from langgraph.prebuilt import ToolNode
-    graph.add_node("llm", call_llm)
-    graph.add_node("tools", ToolNode(TOOLS))
-    graph.add_edge("tools", "llm")
-    graph.set_entry_point("llm")
-    return graph.compile()
+        # Default: try total
+        df = dbx.agg_daily(start_iso, end_iso, region)
+        total = float(df["total_kwh"].sum()) if not df.empty else 0.0
+        scope = region or "All regions"
+        return f"{scope}: {total:,.0f} kWh from {start_iso} to {end_iso}."
