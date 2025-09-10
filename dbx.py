@@ -15,12 +15,12 @@ SILVER_SCHEMA  = os.getenv("SILVER_SCHEMA_NAME",  "silver_meter_data")
 SILVER_TABLE   = os.getenv("SILVER_TABLE_NAME",   "tbl_meterdata")
 
 _cache: Dict[str, Any] = {"ts": 0, "semantic": None, "region_maps": None, "gold_tables": None}
-TTL = 25 * 60  # ~25 min (align to 30 min refresh)
+TTL = 25 * 60  # ~25 min (aligns with ~30 min refresh)
 
 # --------- SQL helpers ----------
 def _connect():
     if not (HOST and HTTP_PATH and TOKEN):
-        raise RuntimeError("Databricks SQL credentials missing.")
+        raise RuntimeError("Databricks SQL credentials missing (DATABRICKS_HOST/HTTP_PATH/TOKEN).")
     return sql.connect(server_hostname=HOST, http_path=HTTP_PATH, access_token=TOKEN)
 
 def query_df(q: str) -> pd.DataFrame:
@@ -48,6 +48,7 @@ def _columns(catalog: str, schema: str, table: str) -> pd.DataFrame:
         SELECT column_name, data_type
         FROM system.information_schema.columns
         WHERE table_catalog='{catalog}' AND table_schema='{schema}' AND table_name='{table}'
+        ORDER BY ordinal_position
     """)
 
 def _best_col(cols: List[str], pats: List[str]) -> Optional[str]:
@@ -58,6 +59,10 @@ def _best_col(cols: List[str], pats: List[str]) -> Optional[str]:
             if r.search(lc):
                 return orig
     return None
+
+def _sql_in_list(values):
+    """Return a SQL IN (...) list with each value single-quoted."""
+    return ",".join([f"'{str(v)}'" for v in values])
 
 # --------- Discovery ----------
 def infer_semantic_map() -> Dict[str, Any]:
@@ -75,10 +80,12 @@ def infer_semantic_map() -> Dict[str, Any]:
             "schema": GOLD_SCHEMA,
             # daily MV if present
             "daily_mv": next((t for t in gold if t.startswith("mv_agg_meterdata_daily")), None),
-            # region mapping sources (prefer the view you showed)
+            # region mapping sources (prefer the view seen in your screenshot)
             "vw_region_map": "vw_mpan_consumption_consent" if "vw_mpan_consumption_consent" in gold else None,
             "dim_gspgroup": "dim_gspgroup" if "dim_gspgroup" in gold else None,
             "dim_halfhour": "dim_halfhour" if "dim_halfhour" in gold else None,
+            # voltage/connection type mapping
+            "dim_connectiontype": "dim_connectiontype" if "dim_connectiontype" in gold else None,
         },
         "silver": {
             "catalog": SILVER_CATALOG,
@@ -96,6 +103,8 @@ def infer_semantic_map() -> Dict[str, Any]:
         "region_col": _best_col(cn, [r"region", r"gsp.?group.*", r"^gspgroupid$"]),
         "mpan_col":   _best_col(cn, [r"mpan", r"mpancore"]),
         "period_col": _best_col(cn, [r"settlementperiod", r"^period$"]),
+        # connection/voltage indicator in silver (from your tbl_meterdata screenshot)
+        "conn_type_col": _best_col(cn, [r"ConnectionTypeIndicator", r"connection.*type.*indicator", r"connection.*type", r"voltage"]),
     })
 
     _cache["semantic"], _cache["ts"] = semantic, now
@@ -109,7 +118,7 @@ def get_semantic_map_json() -> str:
         indent=2,
     )
 
-# --------- Region mapping (use the GOLD VIEW first) ----------
+# --------- Region mapping (use GOLD VIEW first) ----------
 def _normalize_code(x: str) -> str:
     return re.sub(r"^_+", "", str(x or ""))
 
@@ -127,7 +136,7 @@ def _region_maps() -> Tuple[Dict[str, str], Dict[str, List[str]]]:
     code_to_name: Dict[str, str] = {}
     name_to_codes: Dict[str, List[str]] = {}
 
-    # 1) Preferred: the view `vw_mpan_consumption_consent` (your screenshot)
+    # 1) Preferred: the view `vw_mpan_consumption_consent` (has GSPGroupID + GSPGroupDescription)
     if S["gold"]["vw_region_map"]:
         vw = f"{S['gold']['catalog']}.{S['gold']['schema']}.{S['gold']['vw_region_map']}"
         try:
@@ -171,17 +180,19 @@ def _region_maps() -> Tuple[Dict[str, str], Dict[str, List[str]]]:
     return _cache["region_maps"]
 
 def _region_predicate(region_input: Optional[str], region_col: Optional[str]) -> str:
-    """Allow either human name or code; accept _A/A variants."""
+    """WHERE clause that accepts either human name or code; expands _A/A variants."""
     if not region_input or not region_col:
         return ""
     code_to_name, name_to_codes = _region_maps()
-    if region_input in name_to_codes:  # user chose friendly name
-        in_list = ",".join([f"'{c}'" for c in name_to_codes[region_input]])
+    # user selected a friendly name
+    if region_input in name_to_codes:
+        in_list = _sql_in_list(name_to_codes[region_input])
         return f" AND {region_col} IN ({in_list})"
-    # assume code; expand variants
+    # treat as code; allow variants
     norm = _normalize_code(region_input)
-    variants = {region_input, norm, f"_{norm}"}
-    return f" AND {region_col} IN ({','.join([f\"'{v}'\" for v in variants])})"
+    variants = [region_input, norm, f"_{norm}"]
+    in_list = _sql_in_list(variants)
+    return f" AND {region_col} IN ({in_list})"
 
 def _apply_friendly(df: pd.DataFrame, col: str = "region") -> pd.DataFrame:
     if df.empty or col not in df.columns:
@@ -195,7 +206,7 @@ def _apply_friendly(df: pd.DataFrame, col: str = "region") -> pd.DataFrame:
 def agg_daily(start_date: str, end_date: str, region: Optional[str] = None) -> pd.DataFrame:
     S = infer_semantic_map()
 
-    # Prefer Gold MV if present; try to project friendly name by joining the view
+    # Prefer Gold MV with friendly name join
     if S["gold"]["daily_mv"]:
         mv = f"{S['gold']['catalog']}.{S['gold']['schema']}.{S['gold']['daily_mv']}"
         region_field = "f.GSPGroupID"
@@ -215,10 +226,9 @@ def agg_daily(start_date: str, end_date: str, region: Optional[str] = None) -> p
             )
             region_field = "COALESCE(g.RegionName, f.GSPGroupID)"
 
-        # predicate: if user passed a friendly name and we joined a mapping, filter on the friendly field
         region_pred = ""
         if region:
-            if "COALESCE(" in region_field:  # joined friendly name
+            if "COALESCE(" in region_field:
                 region_pred = f" AND {region_field} = '{region}'"
             else:
                 region_pred = f" AND f.GSPGroupID IN ('{region}','{_normalize_code(region)}','_{_normalize_code(region)}')"
@@ -259,6 +269,7 @@ def agg_daily(start_date: str, end_date: str, region: Optional[str] = None) -> p
     return _apply_friendly(df, "region")
 
 def import_export_breakdown(start_date: str, end_date: str, region: Optional[str] = None) -> pd.DataFrame:
+    """(Kept for completeness) Import vs Export breakdown from silver."""
     S = infer_semantic_map()
     s = S["silver"]
     fq = f"{s['catalog']}.{s['schema']}.{s['table']}"
@@ -273,6 +284,69 @@ def import_export_breakdown(start_date: str, end_date: str, region: Optional[str
         WHERE {d} >= '{start_date}' AND {d} <= '{end_date}' {region_pred}
         GROUP BY CASE WHEN {v} >= 0 THEN 'Import' ELSE 'Export' END
     """)
+
+def _conn_type_mapping_cols() -> Optional[Tuple[str, str]]:
+    """
+    Detect ID and description columns in GOLD dim_connectiontype.
+    Returns (id_col, name_col) or None if not found.
+    """
+    S = infer_semantic_map()
+    dim = S["gold"]["dim_connectiontype"]
+    if not dim:
+        return None
+    cols = _columns(S["gold"]["catalog"], S["gold"]["schema"], dim)["column_name"].tolist()
+    id_col = _best_col(cols, [r"ConnectionTypeIndicator", r"connection.*indicator", r"connection.*type.*id", r"^code$"])
+    name_col = _best_col(cols, [r"Description", r"ConnectionType", r"Voltage", r"Name$"])
+    if id_col and name_col:
+        return (id_col, name_col)
+    return None
+
+def voltage_breakdown(start_date: str, end_date: str, region: Optional[str] = None) -> pd.DataFrame:
+    """
+    Breakdown of kWh by voltage/connection type (e.g., Unmetered, Low Voltage with CT, Low Voltage Whole Current).
+    Uses silver connection-type indicator and maps to friendly names via GOLD dim_connectiontype when available.
+    """
+    S = infer_semantic_map()
+    s = S["silver"]
+    d, v, r, c = s["date_col"], s["value_col"], s["region_col"], s["conn_type_col"]
+    if not (d and v) or not c:
+        return pd.DataFrame(columns=["voltage_band", "kwh"])
+
+    fq = f"{s['catalog']}.{s['schema']}.{s['table']}"
+    region_pred = _region_predicate(region, r)
+
+    # if GOLD dimension exists, join to get friendly names
+    if S["gold"]["dim_connectiontype"]:
+        dim = S["gold"]["dim_connectiontype"]
+        id_name = _conn_type_mapping_cols()
+        if id_name:
+            id_col, name_col = id_name
+            g = f"{S['gold']['catalog']}.{S['gold']['schema']}.{dim}"
+            q = f"""
+            SELECT COALESCE(g.{name_col}, s.{c}) AS voltage_band,
+                   SUM(ABS(s.{v})) AS kwh
+            FROM {fq} s
+            LEFT JOIN {g} g
+              ON s.{c} = g.{id_col}
+            WHERE s.{d} >= '{start_date}' AND s.{d} <= '{end_date}' {region_pred}
+            GROUP BY COALESCE(g.{name_col}, s.{c})
+            ORDER BY kwh DESC
+            """
+            try:
+                return query_df(q)
+            except Exception:
+                pass
+
+    # fallback: group by the indicator in silver
+    q2 = f"""
+    SELECT s.{c} AS voltage_band,
+           SUM(ABS(s.{v})) AS kwh
+    FROM {fq} s
+    WHERE s.{d} >= '{start_date}' AND s.{d} <= '{end_date}' {region_pred}
+    GROUP BY s.{c}
+    ORDER BY kwh DESC
+    """
+    return query_df(q2)
 
 def peak_offpeak(start_date: str, end_date: str, region: Optional[str] = None) -> pd.DataFrame:
     S = infer_semantic_map()
