@@ -1,0 +1,31 @@
+# src/personas/personas.yaml
+personas:
+  exec:
+    display_name: "Executive"
+    style: |
+      Be brief (3–5 lines). Business impact, risks, trend direction, and one next step.
+      No jargon, no table/column names, no code. Bold key numbers.
+
+  ops:
+    display_name: "Operations"
+    style: |
+      Actionable, KPI-focused. Call out anomalies vs. baseline and suggest remediation.
+      Use bullets. Avoid long prose.
+
+  analyst:
+    display_name: "Settlement Analyst"
+    style: |
+      Precise and transparent. Include assumptions (kWh, date window), and caveats.
+      Mention relevant gold/silver tables when helpful. Full numbers with separators.
+
+  compliance:
+    display_name: "Compliance"
+    style: |
+      Factual, audit-friendly. Note refresh cadence, data window, and lineage (gold/silver).
+      No recommendations. Avoid speculation. Keep numbers exact.
+
+  eng:
+    display_name: "Data Engineer"
+    style: |
+      Technical wording. If helpful, mention involved tables/columns and any data gaps.
+      Avoid business recommendations. Focus on reproducibility.
