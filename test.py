@@ -15,3 +15,10 @@ url = f"https://{account}.blob.core.windows.net/{container}/codification_co_fmcg
 blob = BlobClient.from_blob_url(url, credential=cred)
 df = pd.read_csv(io.BytesIO(blob.download_blob().readall()))
 print(df.head())
+
+
+from azure.identity import DefaultAzureCredential
+from azure.storage.blob import BlobServiceClient
+svc = BlobServiceClient("https://productcodingstorage.blob.core.windows.net", credential=DefaultAzureCredential())
+print([b.name for b in svc.get_container_client("rawdata").list_blobs()])
+
