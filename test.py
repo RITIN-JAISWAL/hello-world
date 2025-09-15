@@ -1,31 +1,23 @@
-from azure.identity import ManagedIdentityCredential
-from azure.storage.blob import BlobServiceClient, BlobClient
-import pandas as pd, io, json
+from azure.storage.blob import BlobServiceClient
+import pandas as pd
+import json
 
-account   = "productcodingstorage"
-container = "rawdata"
-cred = ManagedIdentityCredential()
+# Replace with your connection string
+conn_str = "DefaultEndpointsProtocol=https;AccountName=...;AccountKey=...;EndpointSuffix=core.windows.net"
+container_name = "rawdata"
 
-# List blobs (quick permission test)
-svc = BlobServiceClient(f"https://{account}.blob.core.windows.net", credential=cred)
-print([b.name for b in svc.get_container_client(container).list_blobs()][:10])
+# Connect
+blob_service = BlobServiceClient.from_connection_string(conn_str)
+container_client = blob_service.get_container_client(container_name)
 
-# Read one file into memory (no local save)
-url = f"https://{account}.blob.core.windows.net/{container}/codification_co_fmcg.csv"
-blob = BlobClient.from_blob_url(url, credential=cred)
-df = pd.read_csv(io.BytesIO(blob.download_blob().readall()))
+# Example: read CSV
+blob_client = container_client.get_blob_client("codification_co_fmcg.csv")
+stream = blob_client.download_blob().readall()
+df = pd.read_csv(pd.compat.StringIO(stream.decode("utf-8")))
 print(df.head())
 
-
-from azure.identity import DefaultAzureCredential
-from azure.storage.blob import BlobServiceClient
-svc = BlobServiceClient("https://productcodingstorage.blob.core.windows.net", credential=DefaultAzureCredential())
-print([b.name for b in svc.get_container_client("rawdata").list_blobs()])
-# shows which credential in the DefaultAzureCredential chain succeeded
-from azure.identity import DefaultAzureCredential
-from azure.core.credentials import AccessToken
-cred = DefaultAzureCredential()
-token: AccessToken = cred.get_token("https://storage.azure.com/.default")
-print("Got token; expires:", token.expires_on)
-# If this throws, no usable identity was found (RBAC or MI not enabled)
-
+# Example: read JSON
+blob_client = container_client.get_blob_client("dictionary_co_fmcg_cross.json")
+stream = blob_client.download_blob().readall()
+data = json.loads(stream)
+print(data)
