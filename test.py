@@ -1,61 +1,31 @@
-from azure.identity import DefaultAzureCredential
-from azure.storage.blob import BlobServiceClient, BlobClient
-import pandas as pd
-import io, json, os
+from azureml.core import Workspace, Datastore
+import pandas as pd, json, io, requests
 
-# Storage details
-storage_account = "productcodingstorage"
-container = "rawdata"
+# 1. Load AML workspace
+ws = Workspace.from_config()
 
-# Authenticate (uses AML compute's managed identity automatically)
-credential = DefaultAzureCredential()
-service_client = BlobServiceClient(
-    f"https://{storage_account}.blob.core.windows.net",
-    credential=credential
-)
-container_client = service_client.get_container_client(container)
+# 2. Get datastore (default or by name)
+ds = Datastore.get(ws, "productcodingstorage")
 
-def load_blob_file(blob_name: str):
-    """Detect file type by extension and load from blob directly into memory."""
-    blob = container_client.get_blob_client(blob_name)
-    data = blob.download_blob().readall()
-    
-    ext = os.path.splitext(blob_name)[1].lower()
-    
-    if ext == ".csv":
-        df = pd.read_csv(io.BytesIO(data))
-        return ("csv", df)
-    
-    elif ext in [".xlsx", ".xls"]:
-        df = pd.read_excel(io.BytesIO(data))
-        return ("excel", df)
-    
-    elif ext == ".json":
-        js = json.loads(data)
-        return ("json", js)
-    
-    else:
-        return ("unknown", data)
+# 3. Build URLs for each blob in rawdata/
+csv_url  = ds.path("rawdata/codification_co_fmcg.csv").as_download_url()
+json_url = ds.path("rawdata/dictionary_co_fmcg_cross.json").as_download_url()
+xlsx_url = ds.path("rawdata/Attributes definition and types4.xlsx").as_download_url()
 
-# --- Auto-list all blobs in the rawdata/ folder ---
-files = [b.name for b in container_client.list_blobs() if b.name.startswith("rawdata/")]
+print("Secure URLs generated (with SAS):")
+print(csv_url)
 
-print("Files found in rawdata/:")
-for f in files:
-    print(" -", f)
+# 4. Stream directly into Pandas / JSON
+df_csv = pd.read_csv(csv_url)
+print("CSV Preview:")
+print(df_csv.head())
 
-# --- Auto-load everything ---
-results = {}
-for f in files:
-    fname = f.split("/")[-1]  # strip 'rawdata/' prefix for dict key
-    ftype, content = load_blob_file(f)
-    results[fname] = (ftype, content)
-    print(f"✔ Loaded {fname} as {ftype}")
+df_xlsx = pd.read_excel(xlsx_url)
+print("Excel Preview:")
+print(df_xlsx.head())
 
-# --- Preview some outputs ---
-for fname, (ftype, content) in results.items():
-    print(f"\nPreview of {fname} ({ftype}):")
-    if ftype in ["csv", "excel"]:
-        print(content.head())
-    elif ftype == "json":
-        print(str(content)[:300])
+# For JSON, fetch into memory
+r = requests.get(json_url)
+data_json = r.json()
+print("JSON Preview (first 300 chars):")
+print(str(data_json)[:300])
