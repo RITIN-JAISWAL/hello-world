@@ -21,4 +21,11 @@ from azure.identity import DefaultAzureCredential
 from azure.storage.blob import BlobServiceClient
 svc = BlobServiceClient("https://productcodingstorage.blob.core.windows.net", credential=DefaultAzureCredential())
 print([b.name for b in svc.get_container_client("rawdata").list_blobs()])
+# shows which credential in the DefaultAzureCredential chain succeeded
+from azure.identity import DefaultAzureCredential
+from azure.core.credentials import AccessToken
+cred = DefaultAzureCredential()
+token: AccessToken = cred.get_token("https://storage.azure.com/.default")
+print("Got token; expires:", token.expires_on)
+# If this throws, no usable identity was found (RBAC or MI not enabled)
 
