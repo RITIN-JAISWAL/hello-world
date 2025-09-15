@@ -1,31 +1,26 @@
-from azureml.core import Workspace, Datastore
-import pandas as pd, json, io, requests
+from azure.identity import InteractiveBrowserCredential
+from azure.storage.blob import BlobClient
+import pandas as pd, io, json
 
-# 1. Load AML workspace
-ws = Workspace.from_config()
+account   = "productcodingstorage"
+container = "rawdata"
+cred = InteractiveBrowserCredential()   # will prompt you to sign in
 
-# 2. Get datastore (default or by name)
-ds = Datastore.get(ws, "productcodingstorage")
+def read_csv(name):
+    url = f"https://{account}.blob.core.windows.net/{container}/{name}"
+    data = BlobClient.from_blob_url(url, credential=cred).download_blob().readall()
+    return pd.read_csv(io.BytesIO(data))
 
-# 3. Build URLs for each blob in rawdata/
-csv_url  = ds.path("rawdata/codification_co_fmcg.csv").as_download_url()
-json_url = ds.path("rawdata/dictionary_co_fmcg_cross.json").as_download_url()
-xlsx_url = ds.path("rawdata/Attributes definition and types4.xlsx").as_download_url()
+def read_excel(name, **kw):
+    url = f"https://{account}.blob.core.windows.net/{container}/{name}"
+    data = BlobClient.from_blob_url(url, credential=cred).download_blob().readall()
+    return pd.read_excel(io.BytesIO(data), **kw)
 
-print("Secure URLs generated (with SAS):")
-print(csv_url)
+def read_json(name):
+    url = f"https://{account}.blob.core.windows.net/{container}/{name}"
+    data = BlobClient.from_blob_url(url, credential=cred).download_blob().readall()
+    return json.loads(data)
 
-# 4. Stream directly into Pandas / JSON
-df_csv = pd.read_csv(csv_url)
-print("CSV Preview:")
-print(df_csv.head())
-
-df_xlsx = pd.read_excel(xlsx_url)
-print("Excel Preview:")
-print(df_xlsx.head())
-
-# For JSON, fetch into memory
-r = requests.get(json_url)
-data_json = r.json()
-print("JSON Preview (first 300 chars):")
-print(str(data_json)[:300])
+df_csv  = read_csv("codification_co_fmcg.csv")
+df_xlsx = read_excel("Attributes definition and types4.xlsx")
+jobj    = read_json("dictionary_co_fmcg_cross.json")
