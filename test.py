@@ -1,26 +1,17 @@
-from azure.identity import InteractiveBrowserCredential
-from azure.storage.blob import BlobClient
+from azure.identity import ManagedIdentityCredential
+from azure.storage.blob import BlobServiceClient, BlobClient
 import pandas as pd, io, json
 
 account   = "productcodingstorage"
 container = "rawdata"
-cred = InteractiveBrowserCredential()   # will prompt you to sign in
+cred = ManagedIdentityCredential()
 
-def read_csv(name):
-    url = f"https://{account}.blob.core.windows.net/{container}/{name}"
-    data = BlobClient.from_blob_url(url, credential=cred).download_blob().readall()
-    return pd.read_csv(io.BytesIO(data))
+# List blobs (quick permission test)
+svc = BlobServiceClient(f"https://{account}.blob.core.windows.net", credential=cred)
+print([b.name for b in svc.get_container_client(container).list_blobs()][:10])
 
-def read_excel(name, **kw):
-    url = f"https://{account}.blob.core.windows.net/{container}/{name}"
-    data = BlobClient.from_blob_url(url, credential=cred).download_blob().readall()
-    return pd.read_excel(io.BytesIO(data), **kw)
-
-def read_json(name):
-    url = f"https://{account}.blob.core.windows.net/{container}/{name}"
-    data = BlobClient.from_blob_url(url, credential=cred).download_blob().readall()
-    return json.loads(data)
-
-df_csv  = read_csv("codification_co_fmcg.csv")
-df_xlsx = read_excel("Attributes definition and types4.xlsx")
-jobj    = read_json("dictionary_co_fmcg_cross.json")
+# Read one file into memory (no local save)
+url = f"https://{account}.blob.core.windows.net/{container}/codification_co_fmcg.csv"
+blob = BlobClient.from_blob_url(url, credential=cred)
+df = pd.read_csv(io.BytesIO(blob.download_blob().readall()))
+print(df.head())
