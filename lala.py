@@ -1,54 +1,43 @@
 import pandas as pd
 import numpy as np
+import re
 
-# --- 1) Build a code -> label map from `attribute` ---
-# Adjust the column names if yours differ
-# Example columns (from your screenshot): idAtributo, Descripcion
-attr_map = (
-    attribute
-      .assign(idAtributo=lambda d: d['idAtributo'].astype(str).str.upper().str.strip())
-      .set_index('idAtributo')['Descripcion']
-      .astype(str)
-      .str.strip()
-      .to_dict()
-)
+# --- Build prefix -> label map from `attribute` ---
+# idAtributo might be float/str; coerce to int and zero-pad to make A####.
+attr = attribute[['idAtributo','Descripcion']].copy()
+attr['idAtributo'] = pd.to_numeric(attr['idAtributo'], errors='coerce').dropna().astype(int)
+attr['prefix'] = 'A' + attr['idAtributo'].astype(str).str.zfill(4)
+attr_map = dict(zip(attr['prefix'], attr['Descripcion'].astype(str).str.strip()))
 
-# --- 2) Helper to parse one mst cell like "A00001:1,A00022:3" into {label: value} ---
-def parse_and_map(cell):
+# --- Parser for one cell like "A00001:1,A00012:3, A00022:9" ---
+def map_cell(cell):
     if pd.isna(cell) or not str(cell).strip():
         return {}
     out = {}
-    for token in str(cell).split(','):
-        token = token.strip()
-        if not token:
+    for tok in re.split(r'\s*,\s*', str(cell).strip()):
+        if not tok:
             continue
         # split into code and value
-        if ':' in token:
-            code, val = token.split(':', 1)
-            code = code.upper().strip()
+        if ':' in tok:
+            code, val = tok.split(':', 1)
             val = val.strip()
         else:
-            code, val = token.upper().strip(), np.nan
+            code, val = tok, np.nan
+        code = code.strip().upper()
 
-        # map code -> human label; if not found, keep the code
-        label = attr_map.get(code, code)
+        # use the A#### prefix to look up the human label
+        prefix = code[:5]  # e.g. 'A0000', 'A0001', ...
+        label = attr_map.get(prefix, prefix)  # fall back to the prefix if unknown
         out[label] = val
     return out
 
-# --- 3) Apply to the 4th column of `mst` and expand ---
-# If you know the name, use mst['<your_col_name>'] instead of iloc[:, 3]
-mapped_dicts = mst.iloc[:, 3].apply(parse_and_map)
+# --- Apply to mst column 4 (0-based) and expand ---
+mapped = mst.iloc[:, 4].apply(map_cell)
 
-# A) If you want the *replaced tokens* still as comma text like "Sector:1, Brand:2, ...":
-def dict_to_str(d):
-    return ', '.join(f'{k}:{v}' for k, v in d.items()) if d else np.nan
+# If you want a readable text version:
+mst['attributes_readable'] = mapped.apply(lambda d: ', '.join(f'{k}:{v}' for k,v in d.items()) if d else np.nan)
 
-mst['attributes_readable'] = mapped_dicts.apply(dict_to_str)
-
-# B) If you prefer *proper columns* (one col per attribute, holding the values):
-expanded = pd.json_normalize(mapped_dicts).astype('object')  # keeps strings like "1"
-# Optional: prefix columns if you like
-# expanded = expanded.add_prefix('attr_')
-
-# Attach to mst (and drop the original raw column if desired)
-mst = pd.concat([mst.drop(mst.columns[3], axis=1), expanded], axis=1)
+# If you want proper columns (Sector, Category, Company, Brand, ...):
+expanded = pd.json_normalize(mapped).astype('object')  # keep values as strings like "1"
+# Attach and drop the raw column-4 if you don’t need it
+mst = pd.concat([mst.drop(mst.columns[4], axis=1), expanded], axis=1)
