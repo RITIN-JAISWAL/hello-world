@@ -175,3 +175,38 @@ values_df.columns = [f'attribute_value {i+1}' for i in range(values_df.shape[1])
 # Attach back
 mst = pd.concat([mst, values_df], axis=1)
 
+
+
+
+
+
+import pandas as pd
+
+# --- 1) Build dataframe from JSON ---
+rows = []
+for node in J["dict"]:   # assuming your JSON is in variable J
+    code = node.get("id", "").strip().upper()   # e.g., "A0000"
+    sl   = str(node.get("sl", "")).strip()
+    if code.startswith("A"):
+        try:
+            num_id = int(code[1:])   # "A0000" -> 0
+        except:
+            continue
+        rows.append({"ID": num_id, "SL": sl})
+
+json_df = pd.DataFrame(rows)
+
+# --- 2) Normalise attribute dataframe ---
+attr_df = attribute.copy()
+attr_df = attr_df.rename(columns={"IdAtributo": "ID", "Descricao": "Descricao"})
+attr_df["ID"] = pd.to_numeric(attr_df["ID"], errors="coerce").astype("Int64")
+
+# --- 3) Join on ID ---
+merged = json_df.merge(attr_df, on="ID", how="inner")
+
+# --- 4) Find mismatches ---
+mismatches = merged[merged["SL"].str.strip().str.lower() != merged["Descricao"].str.strip().str.lower()]
+
+print(mismatches)
+
+
