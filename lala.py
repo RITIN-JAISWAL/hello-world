@@ -12,37 +12,52 @@ mst = pd.concat([mst, split_cols], axis=1)
 
 
 
-
-
 import pandas as pd
 import numpy as np
+import re
 
-# --- 1. Build a mapping from A#### prefix to Descricao ---
-attr_map = {}
-for _, row in attribute.iterrows():
-    try:
-        id_val = int(row['idAtributo'])
-        prefix = "A" + str(id_val).zfill(4)   # e.g. 0 -> A0000, 1 -> A0001
-        attr_map[prefix] = str(row['Descricao']).strip()
-    except:
-        continue
+# ---------- 1) Find the right columns in `attribute` ----------
+# handles naming variants like: IdAtributo / idAtributo / id_atributo
+def _pick(colnames, candidates):
+    cand = {c.lower() for c in candidates}
+    for c in colnames:
+        if c.lower() in cand:
+            return c
+    raise KeyError(f"None of {candidates} found in columns: {list(colnames)}")
 
-# --- 2. Function to map one token like "A0000:1" ---
-def replace_code(token):
-    if pd.isna(token) or not str(token).strip():
+id_col   = _pick(attribute.columns, ["IdAtributo","idAtributo","id_atributo","idatributo"])
+desc_col = _pick(attribute.columns, ["Descricao","Descrição","Descripcion","descricao","descrição"])
+
+# ---------- 2) Build prefix -> label map, e.g. 'A0000' -> 'Sector' ----------
+attr_tmp = attribute[[id_col, desc_col]].copy()
+attr_tmp[id_col] = pd.to_numeric(attr_tmp[id_col], errors="coerce").astype("Int64")
+attr_tmp = attr_tmp.dropna(subset=[id_col])
+
+attr_tmp["prefix"] = "A" + attr_tmp[id_col].astype(int).astype(str).str.zfill(4)
+attr_map = dict(zip(attr_tmp["prefix"], attr_tmp[desc_col].astype(str).str.strip()))
+
+# ---------- 3) Function to convert "A0000:1" -> "Sector:1" ----------
+def _map_token(token: str):
+    if token is None or (isinstance(token, float) and np.isnan(token)):
         return np.nan
-    token = str(token).strip()
-    if ":" in token:
-        code, val = token.split(":", 1)
-        code = code.strip().upper()
+    s = str(token).strip()
+    if s in ("", "None", "nan"):
+        return np.nan
+    # split by ":" once
+    if ":" in s:
+        code, val = s.split(":", 1)
         val = val.strip()
-        label = attr_map.get(code, code)  # fallback: keep original code
-        return f"{label}:{val}"
     else:
-        code = token.strip().upper()
-        label = attr_map.get(code, code)
-        return label
+        code, val = s, ""
+    code = code.strip().upper()
+    prefix = code[:5]  # 'A0000', 'A0017', ...
+    label = attr_map.get(prefix, prefix)
+    return f"{label}:{val}" if val != "" else label
 
-# --- 3. Apply the replacement to your split columns ---
-for col in [c for c in mst.columns if c.startswith("attribute")]:
-    mst[col] = mst[col].apply(replace_code)
+# ---------- 4) Apply to all "attribute *" columns ----------
+# ensure column names are strings (avoids the 'int has no attribute startswith' error)
+mst.columns = mst.columns.map(str)
+
+attr_cols = [c for c in mst.columns if c.lower().startswith("attribute")]
+for c in attr_cols:
+    mst[c] = mst[c].apply(_map_token)
