@@ -81,3 +81,67 @@ values_df.columns = [f'attribute_value {i+1}' for i in range(values_df.shape[1])
 
 # Attach to mst
 mst = pd.concat([mst, values_df], axis=1)
+
+
+
+
+
+import pandas as pd
+import numpy as np
+import re
+
+# --- 0) Split column 4 into 'attribute i' columns (you already have this) ---
+split_cols = mst.iloc[:, 4].astype(str).str.split(',', expand=True)
+split_cols.columns = [f'attribute {i+1}' for i in range(split_cols.shape[1])]
+mst = pd.concat([mst, split_cols], axis=1)
+
+# --- 1) Build A#### -> label map using `attribute` + `dreamy` ---
+# We expect:
+#   attribute: columns ['IdAtributo', 'IdTipoAtributo', ...]
+#   dreamy:    columns ['IdTipoAtributo', 'Descricao', ...]  (Descricao = human label)
+# This produces: 'A0000' -> 'Sector', 'A0001' -> 'Category', etc.
+
+# Make a safe copy with normalized column names (case-insensitive)
+attr_df = attribute.copy()
+dreamy_df = dreamy.copy()
+
+# Coerce numeric ids
+attr_df['IdAtributo'] = pd.to_numeric(attr_df['IdAtributo'], errors='coerce').astype('Int64')
+attr_df['IdTipoAtributo'] = pd.to_numeric(attr_df['IdTipoAtributo'], errors='coerce').astype('Int64')
+dreamy_df['IdTipoAtributo'] = pd.to_numeric(dreamy_df['IdTipoAtributo'], errors='coerce').astype('Int64')
+
+# Join to fetch the human label from dreamy
+attr_joined = (
+    attr_df[['IdAtributo','IdTipoAtributo']]
+    .merge(dreamy_df[['IdTipoAtributo','Descricao']], on='IdTipoAtributo', how='left')
+)
+
+# Build A-prefix and map to label
+attr_joined['Acode'] = 'A' + attr_joined['IdAtributo'].astype(int).astype(str).str.zfill(4)
+Acode_to_label = dict(zip(attr_joined['Acode'], attr_joined['Descricao'].astype(str)))
+
+# --- 2) Converter: "A0000:1" -> "Sector: 1" using the map above ---
+def to_attr_value(token: str):
+    if pd.isna(token):
+        return np.nan
+    s = str(token).strip()
+    if not s or s.lower() in {'nan', 'none'}:
+        return np.nan
+
+    if ':' in s:
+        code, val = s.split(':', 1)
+        code, val = code.strip().upper(), val.strip()
+    else:
+        code, val = s.strip().upper(), ''   # sometimes there may be no value part
+
+    label = Acode_to_label.get(code[:5], code[:5])   # fall back to prefix if missing
+    return f"{label}: {val}" if val != '' else label
+
+# --- 3) Create the attribute_values i columns in one shot ---
+mst.columns = mst.columns.map(str)  # ensure string names
+attr_cols = [c for c in mst.columns if c.lower().startswith('attribute ')]
+attr_values = mst[attr_cols].applymap(to_attr_value)
+attr_values.columns = [f'attribute_values {i+1}' for i in range(attr_values.shape[1])]
+
+# Attach to mst
+mst = pd.concat([mst, attr_values], axis=1)
