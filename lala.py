@@ -86,62 +86,92 @@ mst = pd.concat([mst, values_df], axis=1)
 
 
 
+
+
+
+
+
 import pandas as pd
 import numpy as np
-import re
+import json
 
-# --- 0) Split column 4 into 'attribute i' columns (you already have this) ---
+# --- 0) Split column 4 into 'attribute i' columns (you already had this)
 split_cols = mst.iloc[:, 4].astype(str).str.split(',', expand=True)
 split_cols.columns = [f'attribute {i+1}' for i in range(split_cols.shape[1])]
 mst = pd.concat([mst, split_cols], axis=1)
 
-# --- 1) Build A#### -> label map using `attribute` + `dreamy` ---
-# We expect:
-#   attribute: columns ['IdAtributo', 'IdTipoAtributo', ...]
-#   dreamy:    columns ['IdTipoAtributo', 'Descricao', ...]  (Descricao = human label)
-# This produces: 'A0000' -> 'Sector', 'A0001' -> 'Category', etc.
+# --- 1) Build maps from the JSON dictionary you loaded into `data`
+nodes = data["dict"] if isinstance(data, dict) and "dict" in data else data
 
-# Make a safe copy with normalized column names (case-insensitive)
-attr_df = attribute.copy()
-dreamy_df = dreamy.copy()
+attr_label = {}        # 'A0000' -> attribute label from JSON, e.g. "Sector"
+value_label_map = {}   # 'A0000' -> {"1": "Bebidas", "4": "Alimentos", ...}
 
-# Coerce numeric ids
+for node in nodes:
+    code = str(node.get("id", "")).strip().upper()
+    if not code:
+        continue
+    sl_attr = str(node.get("sl", "")).strip()
+    if sl_attr:
+        attr_label[code] = sl_attr.title() if sl_attr.isupper() else sl_attr
+
+    vals = {}
+    for ch in node.get("b", []) or []:
+        vid = str(ch.get("id", "")).strip()
+        slv = str(ch.get("sl", "")).strip()
+        if vid and slv:
+            vals[vid] = slv
+    if vals:
+        value_label_map[code] = vals
+
+# --- 2) Build the "middle" label from attribute + dreamy
+# attribute: columns include 'IdAtributo', 'IdTipoAtributo'
+# dreamy:    columns include 'IdTipoAtributo', 'Descricao'
+attr_df = attribute[['IdAtributo','IdTipoAtributo']].copy()
+dreamy_df = dreamy[['IdTipoAtributo','Descricao']].copy()
+
 attr_df['IdAtributo'] = pd.to_numeric(attr_df['IdAtributo'], errors='coerce').astype('Int64')
 attr_df['IdTipoAtributo'] = pd.to_numeric(attr_df['IdTipoAtributo'], errors='coerce').astype('Int64')
 dreamy_df['IdTipoAtributo'] = pd.to_numeric(dreamy_df['IdTipoAtributo'], errors='coerce').astype('Int64')
 
-# Join to fetch the human label from dreamy
-attr_joined = (
-    attr_df[['IdAtributo','IdTipoAtributo']]
-    .merge(dreamy_df[['IdTipoAtributo','Descricao']], on='IdTipoAtributo', how='left')
+attr_join = (
+    attr_df.merge(dreamy_df, on='IdTipoAtributo', how='left')  # adds dreamy.Descricao
 )
+attr_join['Acode'] = 'A' + attr_join['IdAtributo'].astype(int).astype(str).str.zfill(4)
 
-# Build A-prefix and map to label
-attr_joined['Acode'] = 'A' + attr_joined['IdAtributo'].astype(int).astype(str).str.zfill(4)
-Acode_to_label = dict(zip(attr_joined['Acode'], attr_joined['Descricao'].astype(str)))
+# Map: 'A0000' -> dreamy.Descricao   (the “middle” label you want)
+Acode_to_dreamy_desc = dict(zip(attr_join['Acode'], attr_join['Descricao'].astype(str)))
 
-# --- 2) Converter: "A0000:1" -> "Sector: 1" using the map above ---
-def to_attr_value(token: str):
-    if pd.isna(token):
+# --- 3) Converter: "A0000:1" -> "Sector:<dreamy.Descricao>:Bebidas"
+def token_to_full(tok):
+    if pd.isna(tok):
         return np.nan
-    s = str(token).strip()
-    if not s or s.lower() in {'nan', 'none'}:
+    s = str(tok).strip()
+    if not s or s.lower() in {"nan", "none"}:
         return np.nan
 
-    if ':' in s:
-        code, val = s.split(':', 1)
+    if ":" in s:
+        code, val = s.split(":", 1)
         code, val = code.strip().upper(), val.strip()
     else:
-        code, val = s.strip().upper(), ''   # sometimes there may be no value part
+        code, val = s.strip().upper(), ""
 
-    label = Acode_to_label.get(code[:5], code[:5])   # fall back to prefix if missing
-    return f"{label}: {val}" if val != '' else label
+    prefix = code[:5]
 
-# --- 3) Create the attribute_values i columns in one shot ---
-mst.columns = mst.columns.map(str)  # ensure string names
-attr_cols = [c for c in mst.columns if c.lower().startswith('attribute ')]
-attr_values = mst[attr_cols].applymap(to_attr_value)
-attr_values.columns = [f'attribute_values {i+1}' for i in range(attr_values.shape[1])]
+    left   = attr_label.get(prefix, prefix)                       # from JSON (e.g., "Sector")
+    middle = Acode_to_dreamy_desc.get(prefix, "")                 # from attribute+dreamy (e.g., "SECTOR")
+    right  = value_label_map.get(prefix, {}).get(val, val)        # from JSON values (e.g., "Bebidas")
 
-# Attach to mst
-mst = pd.concat([mst, attr_values], axis=1)
+    if middle:
+        return f"{left}:{middle}:{right}" if right else f"{left}:{middle}"
+    else:
+        return f"{left}:{right}" if right else left
+
+# --- 4) Create 'attribute_value i' columns
+mst.columns = mst.columns.map(str)
+attr_cols = [c for c in mst.columns if c.lower().startswith("attribute ")]
+values_df = mst[attr_cols].applymap(token_to_full)
+values_df.columns = [f'attribute_value {i+1}' for i in range(values_df.shape[1])]
+
+# Attach back
+mst = pd.concat([mst, values_df], axis=1)
+
