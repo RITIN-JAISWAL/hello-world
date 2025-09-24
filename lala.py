@@ -210,3 +210,18 @@ mismatches = merged[merged["SL"].str.strip().str.lower() != merged["Descricao"].
 print(mismatches)
 
 
+
+
+def extract_weight(text):
+    if pd.isna(text):
+        return None
+    s = str(text)
+    # Look for numbers possibly followed by units (g, gr, ml, kg, etc.)
+    match = re.search(r'(\d+(?:[.,]\d+)?)\s*(gr|g|kg|ml|l|lt|lb)?', s, flags=re.IGNORECASE)
+    if match:
+        return match.group(1)  # just the number
+    return None
+
+# Apply on column 1
+mst["Weight"] = mst.iloc[:,1].apply(extract_weight)
+
