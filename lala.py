@@ -212,16 +212,23 @@ print(mismatches)
 
 
 
-def extract_weight(text):
+# Function to extract number + unit
+def extract_qty_unit(text):
     if pd.isna(text):
         return None
     s = str(text)
-    # Look for numbers possibly followed by units (g, gr, ml, kg, etc.)
-    match = re.search(r'(\d+(?:[.,]\d+)?)\s*(gr|g|kg|ml|l|lt|lb)?', s, flags=re.IGNORECASE)
+    # Regex: number + optional decimal + optional space + unit
+    match = re.search(r'(\d+(?:[.,]\d+)?)\s*(gr|g|kg|ml|l|lt|lb)', s, flags=re.IGNORECASE)
     if match:
-        return match.group(1)  # just the number
+        qty  = match.group(1).replace(",", ".")   # handle commas as decimals
+        unit = match.group(2).lower()
+        return f"{qty} {unit}"
     return None
 
-# Apply on column 1
-mst["Weight"] = mst.iloc[:,1].apply(extract_weight)
+# Apply on column 1 (product description)
+mst["Weight_Unit"] = mst.iloc[:, 1].apply(extract_qty_unit)
+
+# If you also want to split into two separate columns:
+mst["Weight"] = mst["Weight_Unit"].str.extract(r'(\d+(?:\.\d+)?)').astype(float)
+mst["Unit"]   = mst["Weight_Unit"].str.extract(r'([a-zA-Z]+)')
 
