@@ -1,743 +1,348 @@
-# ====================================================
-# STEP 0. Setup & Imports
-# ====================================================
-import os, io, re, json, base64, datetime
-from collections import Counter
+# =========================
+# Retail Attribute Coding EDA (Stages 1-4)
+# Author intent: senior DS + retail labeling domain expert
+# =========================
 
+import pandas as pd
 import numpy as np
-import pandas as pd
+import re
+import unicodedata
 import matplotlib.pyplot as plt
+from collections import Counter, defaultdict
+from itertools import chain
 
-from azure.storage.blob import BlobServiceClient
-from jinja2 import Template
+pd.set_option("display.max_columns", None)
+pd.set_option("display.width", 180)
 
-# Matplotlib inline style
-%matplotlib inline
-plt.style.use("seaborn-v0_8")
+# ---- 0) Setup ----
+df = merged_df.copy()
 
-# Ensure connection string is set
-CONN_STR = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
-if not CONN_STR:
-    raise RuntimeError("⚠️ Please set AZURE_STORAGE_CONNECTION_STRING")
+# Helper: safe display head with many cols
+def show(df_, n=5, title=None):
+    if title: print(f"\n=== {title} ===")
+    display(df_.head(n))
 
-# Container + blob names
-container = "rawdata"
-ocr_blob = "OCR_colombia.csv"
-master_blob = "Attributes_definitions.csv"
-dict_blob = "dictionary_co.json"
+# Helper: remove accents (brand/category normalization)
+def strip_accents(s: str) -> str:
+    if s is None or pd.isna(s): return s
+    return "".join(c for c in unicodedata.normalize("NFD", str(s)) if unicodedata.category(c) != "Mn")
 
+# Helper: simple barh plot
+def barh(series, title="", top=20, figsize=(8,6)):
+    s = series.dropna().head(top) if isinstance(series, pd.Series) else pd.Series(series).head(top)
+    plt.figure(figsize=figsize)
+    plt.barh(range(len(s))[::-1], list(s.values)[::-1])
+    plt.yticks(range(len(s))[::-1], list(s.index)[::-1])
+    plt.title(title)
+    plt.tight_layout()
+    plt.show()
 
+# Helper: hist plot
+def hist(series, bins=50, title="", xlim=None, figsize=(8,4)):
+    plt.figure(figsize=figsize)
+    plt.hist(series.dropna(), bins=bins)
+    if xlim: plt.xlim(*xlim)
+    plt.title(title)
+    plt.tight_layout()
+    plt.show()
 
-# ====================================================
-# STEP 1. Azure Blob Utilities
-# ====================================================
-def get_blob_client(container: str, blob: str):
-    svc = BlobServiceClient.from_connection_string(CONN_STR)
-    return svc.get_blob_client(container=container, blob=blob)
+# Identify attribute columns
+attr_cols       = [c for c in df.columns if str(c).lower().startswith("attribute ") and "value" not in str(c).lower()]
+attr_value_cols = [c for c in df.columns if str(c).lower().startswith("attribute_value ")]
 
-def download_blob_bytes(container: str, blob: str) -> bytes:
-    return get_blob_client(container, blob).download_blob().readall()
+# =========================
+# 1) Dataset Overview
+# =========================
+print(f"Rows: {df.shape[0]:,} | Columns: {df.shape[1]}")
+show(df, 5, "Sample rows")
 
-def upload_blob_text(container: str, blob: str, text: str):
-    get_blob_client(container, blob).upload_blob(text.encode("utf-8"), overwrite=True)
+info_df = pd.DataFrame({
+    "dtype": df.dtypes.astype(str),
+    "null_%": df.isna().mean().round(4)*100,
+    "nunique": df.nunique(dropna=True)
+}).sort_values(["null_%", "nunique"], ascending=[False, True])
+show(info_df, 50, "Column profile (dtype / %null / nunique)")
 
+print("Duplicate product_id rows:", int(df.duplicated(subset=["product_id"]).sum()))
 
-# ====================================================
-# STEP 2. CSV / JSON Utilities
-# ====================================================
-def safe_read_csv(bytes_data: bytes, dtype=None):
-    buf = io.BytesIO(bytes_data)
-    try:
-        return pd.read_csv(buf, dtype=dtype)
-    except Exception:
-        buf.seek(0)
-        return pd.read_csv(buf, sep=";", dtype=dtype)
+# Null % bar
+null_series = (df.isna().mean()*100).sort_values(ascending=False)
+barh(null_series, "Null % by column", top=40, figsize=(10,10))
 
-def ensure_cols(df: pd.DataFrame, rename_map: dict):
-    for target, alts in rename_map.items():
-        if target in df.columns: continue
-        for a in alts:
-            if a in df.columns:
-                df.rename(columns={a: target}, inplace=True)
-                break
-    return df
+# =========================
+# 2) Description, Category, Brand quality
+# =========================
+# Normalize description whitespace
+df["desc"] = (df["1"].astype(str)
+                .str.replace("\u00A0", " ", regex=False)
+                .str.replace("\s+", " ", regex=True)
+                .str.strip())
 
+df["desc_len"] = df["desc"].str.len()
+hist(df["desc_len"], bins=60, title="Description length distribution")
 
-# ====================================================
-# STEP 3. Quantity Parsing for OCR (Size/Weight)
-# ====================================================
-SIZE_PATTERNS = [
-    r'(?P<qty>\d+[.,]?\d*)\s?(?P<unit>kg|g|gr|gramos|l|lt|litro|ml|mL)\b',
-    r'(?P<qty>\d+[.,]?\d*)\s?(?P<unit>oz|lb)\b',
-    r'(?P<qty>\d+[.,]?\d*)\s?x\s?(?P<pack>\d+)\b',
-]
+# Brand cleanliness
+df["brand_raw"]   = df["brand"].astype(str)
+df["brand_clean"] = (df["brand_raw"].str.lower().str.strip()
+                                    .map(strip_accents)
+                                    .str.replace(r"[^a-z0-9 &\-\./]", "", regex=True)
+                                    .str.replace(r"\s+", " ", regex=True)
+                                    .str.strip())
+brand_counts = df["brand_clean"].replace({"nan": np.nan}).value_counts(dropna=True)
 
-def extract_qty(text: str):
-    if not isinstance(text, str):
-        return pd.Series({"qty_value": pd.NA, "qty_unit": pd.NA})
-    t = text.replace(",", ".")
-    for pat in SIZE_PATTERNS:
-        m = re.search(pat, t, flags=re.IGNORECASE)
-        if m and m.groupdict().get("qty") and m.groupdict().get("unit"):
-            try:
-                return pd.Series({"qty_value": float(m.group("qty")), "qty_unit": m.group("unit").lower()})
-            except ValueError:
-                pass
-    return pd.Series({"qty_value": pd.NA, "qty_unit": pd.NA})
+barh(brand_counts, "Top 20 brands (cleaned)", top=20)
 
-def normalize_units(q, u):
-    if pd.isna(q) or not isinstance(u, str): 
-        return pd.NA, pd.NA
-    u = u.lower()
-    if u in ["g","gr","gramos"]: return round(q,3), "g"
-    if u=="kg": return round(q*1000,3), "g"
-    if u in ["ml"]: return round(q,3), "ml"
-    if u in ["l","lt","litro"]: return round(q*1000,3), "ml"
-    if u=="oz": return round(q*28.3495,3), "g"
-    if u=="lb": return round(q*453.592,3), "g"
-    return pd.NA, pd.NA
+# Category cleanliness
+if "category" in df.columns:
+    df["category_clean"] = (df["category"].astype(str).str.lower().str.strip()
+                             .map(strip_accents).str.replace(r"\s+", " ", regex=True))
+    cat_counts = df["category_clean"].replace({"nan": np.nan}).value_counts(dropna=True)
+    barh(cat_counts, "Top 20 categories (cleaned)", top=20)
 
-
-# ====================================================
-# STEP 4. Dictionary Parsing Utilities
-# ====================================================
-def find_values_list(entry: dict):
-    for k in ["b","values","codes","items","options","map"]:
-        if k in entry and isinstance(entry[k], list):
-            return entry[k]
-    for v in entry.values():
-        if isinstance(v, list) and v and isinstance(v[0], dict):
-            return v
-    return []
-
-def pick_code(d: dict):
-    for k in ["c","code","id","k","key"]:
-        if k in d: return str(d[k])
-    return None
-
-def pick_value(d: dict):
-    for k in ["v","value","label","name","text"]:
-        if k in d: return str(d[k])
-    return None
-# ====================================================
-# STEP 5. Load Data from Azure
-# ====================================================
-ocr = safe_read_csv(download_blob_bytes(container, ocr_blob), dtype={"product_id":str})
-mst = safe_read_csv(download_blob_bytes(container, master_blob), dtype={"product_id":str})
-J = json.loads(download_blob_bytes(container, dict_blob).decode("utf-8", errors="ignore"))
-
-print("OCR shape:", ocr.shape)
-print("Master shape:", mst.shape)
-print("Dictionary entries:", len(J.get("dict", [])))
-
-ocr.head(3)
-
-
-# ====================================================
-# STEP 6. Analyze OCR
-# ====================================================
-ocr = ensure_cols(ocr, {"product_id":["prod_id","id","productid"], "ocr_text":["text","ocr","ocrstring"]})
-if "ocr_text" not in ocr.columns: ocr["ocr_text"] = ""
-
-# Add features
-ocr["text_len"] = ocr["ocr_text"].fillna("").astype(str).str.len()
-ocr[["qty_value","qty_unit"]] = ocr["ocr_text"].apply(extract_qty)
-ocr[["qty_std_value","qty_std_unit"]] = ocr.apply(
-    lambda r: normalize_units(r["qty_value"], r["qty_unit"]), axis=1, result_type="expand"
+# Brand duplication examples (same brand with many spellings)
+brand_variants = (
+    df.groupby(["brand_clean"])["brand_raw"]
+      .apply(lambda s: list(pd.Series(s.unique()).head(5)))
+      .reset_index()
+      .rename(columns={"brand_raw":"sample_variants"})
 )
+show(brand_variants.head(20), title="Brand spelling variants (sample)")
+
+# =========================
+# 3) Quantity & Unit analysis (+ normalization readiness)
+# =========================
+# Coerce numeric Quantity and use Unit as-is; also consider qty_value/qty_unit if present
+df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce")
+if "qty_value" in df.columns:
+    df["qty_value"] = pd.to_numeric(df["qty_value"], errors="coerce")
+if "qty_unit" in df.columns:
+    df["qty_unit"] = df["qty_unit"].astype(str).str.lower()
+
+# Unit distribution
+unit_counts = df["Unit"].astype(str).str.lower().value_counts(dropna=True)
+barh(unit_counts, "Unit distribution", top=15)
+
+# Quantity stats & distribution
+show(df["Quantity"].describe(percentiles=[.25,.5,.75,.95,.99]).to_frame("Quantity stats"), title="Quantity stats")
+hist(df["Quantity"], bins=60, title="Quantity histogram (all)")
+hist(df.loc[df["Quantity"] < 2000, "Quantity"], bins=60, title="Quantity histogram (<2000)")
+
+# Outliers
+qty_out_high = df.loc[df["Quantity"] >= 10000, ["product_id","desc","Quantity","Unit"]].head(20)
+qty_out_low  = df.loc[(df["Quantity"]>0) & (df["Quantity"] < 1), ["product_id","desc","Quantity","Unit"]].head(20)
+show(qty_out_high, title="Potential outliers (Quantity >= 10,000)")
+show(qty_out_low,  title="Potential outliers (0 < Quantity < 1)")
+
+# Consistency check with parsed qty_value/qty_unit when available
+if {"qty_value","qty_unit"}.issubset(df.columns):
+    mismatch_qty = df.loc[
+        (df["qty_value"].notna()) & (df["Quantity"].notna()) &
+        (np.round(df["qty_value"], 3) != np.round(df["Quantity"], 3)),
+        ["product_id","desc","Quantity","Unit","qty_value","qty_unit"]
+    ]
+    print("Qty mismatches (Quantity vs qty_value):", len(mismatch_qty))
+    show(mismatch_qty.sample(min(20, len(mismatch_qty))) if len(mismatch_qty) else mismatch_qty, title="Sample quantity mismatches")
+
+# =========================
+# 4) Attribute coverage & shape
+# =========================
+print(f"Detected {len(attr_cols)} attribute slots and {len(attr_value_cols)} attribute_value slots")
+
+# Coverage (# attributes per product)
+df["num_attributes"] = df[attr_cols].notna().sum(axis=1) if attr_cols else 0
+hist(df["num_attributes"], bins=30, title="# Attributes per product")
+
+# Fill % per slot
+if attr_cols:
+    cov = (df[attr_cols].notna().mean()*100).sort_values(ascending=False).round(2)
+    barh(cov, "Coverage % by attribute slot", top=len(attr_cols), figsize=(7,10))
+
+if attr_value_cols:
+    cov_val = (df[attr_value_cols].notna().mean()*100).sort_values(ascending=False).round(2)
+    barh(cov_val, "Coverage % by attribute_value slot", top=len(attr_value_cols), figsize=(7,10))
+
+# Most common attribute codes (A####:v) across slots
+if attr_cols:
+    flattened_attrs = pd.Series(list(chain.from_iterable(df[c].dropna().astype(str).tolist() for c in attr_cols)))
+    # keep only tokens that look like A####:number or A#### (robust)
+    flattened_attrs = flattened_attrs[flattened_attrs.str.match(r'^[A-Za-z]\d{4}(:.*)?$')]
+    top_attr_codes = flattened_attrs.value_counts().head(30)
+    barh(top_attr_codes, "Top attribute codes across all slots", top=30, figsize=(8,10))
+
+# Parse attribute_value "Label:Value" into columns (left/right) for analysis
+def split_attr_val(s):
+    if pd.isna(s): return pd.Series([np.nan, np.nan])
+    parts = str(s).split(":", 1)
+    if len(parts)==1: return pd.Series([parts[0].strip(), np.nan])
+    return pd.Series([parts[0].strip(), parts[1].strip()])
+
+if attr_value_cols:
+    # Build a long-form table for distribution analysis
+    long_rows = []
+    for col in attr_value_cols:
+        temp = df[[col]].copy()
+        temp[["left","right"]] = temp[col].apply(split_attr_val)
+        temp["slot"] = col
+        long_rows.append(temp[["slot","left","right"]])
+    long_df = pd.concat(long_rows, ignore_index=True)
+    # Most common left labels (e.g., "Gramos", "Porciones", "Tipo de Chocolate")
+    left_counts = long_df["left"].dropna().value_counts().head(30)
+    barh(left_counts, "Top attribute_value 'left' labels (semantic attributes)", top=30, figsize=(8,10))
+    show(long_df.dropna().sample(15, random_state=42), title="Sample parsed attribute_value rows")
+
+# Size consistency: Compare Quantity to attribute_value like "Gramos:500" or "Mililitros:500"
+if attr_value_cols:
+    size_like = long_df.dropna()
+    size_like["left_lc"] = size_like["left"].str.lower().map(strip_accents)
+    grams_mask = size_like["left_lc"].str.contains("gram", na=False)
+    ml_mask    = size_like["left_lc"].str.contains("mili|mlit|ml", na=False)  # cover mililitros/mililiters
+    # Collect per product (join back on index alignment)
+    # Note: long_df lost product_id; rebuild quickly:
+    # Build product_id-aware long_df
+    pid_long = []
+    for col in attr_value_cols:
+        tmp = df[["product_id", col]].rename(columns={col:"val"})
+        tmp[["left","right"]] = tmp["val"].apply(split_attr_val)
+        tmp["slot"] = col
+        pid_long.append(tmp[["product_id","slot","left","right"]])
+    pid_long = pd.concat(pid_long, ignore_index=True)
+    pid_long["left_lc"] = pid_long["left"].str.lower().map(strip_accents)
+
+    def to_float(s):
+        if pd.isna(s): return np.nan
+        return pd.to_numeric(str(s).replace(",", "."), errors="coerce")
+
+    grams_df = pid_long.loc[pid_long["left_lc"].str.contains("gram", na=False)].copy()
+    grams_df["right_num"] = grams_df["right"].apply(to_float)
+    ml_df    = pid_long.loc[pid_long["left_lc"].str.contains("mili|mlit|ml", na=False)].copy()
+    ml_df["right_num"] = ml_df["right"].apply(to_float)
+
+    # Join against Quantity/Unit
+    gram_merge = grams_df.merge(df[["product_id","Quantity","Unit"]], on="product_id", how="left")
+    ml_merge   = ml_df.merge(df[["product_id","Quantity","Unit"]], on="product_id", how="left")
+
+    gram_incons = gram_merge.loc[
+        gram_merge["Quantity"].notna() & (np.round(gram_merge["Quantity"],1) != np.round(gram_merge["right_num"],1)),
+        ["product_id","left","right","Quantity","Unit","slot"]
+    ]
+    ml_incons = ml_merge.loc[
+        ml_merge["Quantity"].notna() & (np.round(ml_merge["Quantity"],1) != np.round(ml_merge["right_num"],1)),
+        ["product_id","left","right","Quantity","Unit","slot"]
+    ]
+    print(f"Inconsistencies (Gramos vs Quantity): {len(gram_incons):,}")
+    show(gram_incons.head(20), title="Sample inconsistencies: Gramos vs Quantity")
+    print(f"Inconsistencies (Mililitros vs Quantity): {len(ml_incons):,}")
+    show(ml_incons.head(20), title="Sample inconsistencies: Mililitros vs Quantity")
+
+# =========================
+# 5) Long-tail & class balance (Sector/Category/Brand)
+# =========================
+# Attempt to derive a candidate 'sector' from attribute_value columns if present
+def find_first_label(prefix, default_col=None):
+    """
+    Try to find the first attribute_value whose left label matches 'Sector'/'Categoria' patterns.
+    If default_col is given, use that as a fallback source.
+    """
+    if not attr_value_cols: return pd.Series([np.nan]*len(df))
+    lc = None
+    for col in attr_value_cols:
+        lefts = df[col].str.split(":", n=1).str[0].str.lower()
+        if prefix == "sector":
+            mask = lefts.str.contains("sector", na=False)
+        elif prefix == "category":
+            mask = lefts.str.contains("categ", na=False)  # categoría / categoria
+        else:
+            mask = pd.Series([False]*len(df))
+        vals = df[col].where(mask)
+        if lc is None:
+            lc = vals
+        else:
+            lc = lc.fillna(vals)
+    if default_col and default_col in df.columns:
+        lc = lc.fillna(df[default_col])
+    return lc
+
+df["y_sector_raw"]   = find_first_label("sector")
+df["y_category_raw"] = find_first_label("category", default_col="category")
+df["y_brand_raw"]    = df["brand_clean"]
+
+# Count distributions
+sector_counts = df["y_sector_raw"].dropna().str.split(":").str[0].value_counts()
+category_counts = df["y_category_raw"].dropna().astype(str).value_counts()
+brand_counts = df["brand_clean"].dropna().value_counts()
+
+barh(sector_counts, "Top Sectors (proxy)", top=20)
+barh(category_counts, "Top Categories (proxy)", top=20)
+barh(brand_counts, "Top Brands (cleaned)", top=20)
+
+# Tail coverage (how many classes cover X% of data)
+def headcount_to_cover(series, pct=0.8):
+    s = series.copy()
+    cum = (s.cumsum()/s.sum())
+    k = (cum <= pct).sum()
+    return int(k)
+
+for name, s in [("Sector", sector_counts), ("Category", category_counts), ("Brand", brand_counts)]:
+    if len(s):
+        k80 = headcount_to_cover(s, 0.80)
+        print(f"{name}: Top {k80} classes cover 80% of products (total classes={len(s)})")
+
+# =========================
+# 6) Leakage risk checks (near-dup description signatures)
+# =========================
+def normalize_for_signature(text):
+    s = strip_accents(text)
+    s = re.sub(r"[^a-z0-9 ]", " ", s.lower())
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+df["desc_sig"] = df["desc"].astype(str).apply(normalize_for_signature)
+sig_counts = df["desc_sig"].value_counts()
+dup_sigs = sig_counts[sig_counts>1]
+print("Potential near-duplicates by normalized description:", int(dup_sigs.sum() - len(dup_sigs)))
+show(df.loc[df["desc_sig"].isin(dup_sigs.index), ["product_id","desc"]].head(20),
+     title="Sample near-duplicate descriptions")
+
+# =========================
+# 7) Executive Summary (auto-generated bullets)
+# =========================
+summary = {}
+
+summary["rows"] = int(df.shape[0])
+summary["cols"] = int(df.shape[1])
+summary["nulliest_cols"] = null_series.head(10).round(2).to_dict()
+summary["unit_top"] = unit_counts.head(10).to_dict()
+summary["brand_top"] = brand_counts.head(10).to_dict()
+summary["brand_classes"] = int(brand_counts.size)
+summary["brand_long_tail_80pct"] = headcount_to_cover(brand_counts, 0.80) if len(brand_counts) else 0
+summary["quantity_outliers_ge_10000"] = int((df["Quantity"]>=10000).sum())
+summary["quantity_missing_pct"] = float(df["Quantity"].isna().mean()*100)
+
+if attr_cols:
+    summary["avg_attributes_per_product"] = float(df["num_attributes"].mean())
+if attr_value_cols:
+    summary["attr_value_coverage_median_%"] = float((df[attr_value_cols].notna().mean()*100).median())
+
+if "mismatch_qty" in locals():
+    summary["qty_mismatch_count"] = int(len(mismatch_qty))
+
+if len(sector_counts):
+    summary["sectors_classes"] = int(sector_counts.size)
+    summary["sectors_cover_80"] = headcount_to_cover(sector_counts, 0.80)
+if len(category_counts):
+    summary["categories_classes"] = int(category_counts.size)
+    summary["categories_cover_80"] = headcount_to_cover(category_counts, 0.80)
+
+print("\n===== EXECUTIVE SUMMARY (auto) =====")
+for k,v in summary.items():
+    print(f"- {k}: {v}")
 
-# Summary
-print("OCR rows:", len(ocr))
-print("Unique products:", ocr["product_id"].nunique())
-print("Empty OCR texts:", (ocr["ocr_text"].astype(str).str.strip()=="").sum())
-
-# Visualize
-ocr["text_len"].hist(bins=50, figsize=(6,4))
-plt.title("Distribution of OCR text lengths")
-plt.show()
-
-ocr["qty_std_value"].hist(bins=30, figsize=(6,4))
-plt.title("Distribution of parsed quantities (standardized)")
-plt.show()
-
-
-# ====================================================
-# STEP 7. Analyze Masterfile
-# ====================================================
-mst = ensure_cols(mst, {
-    "product_id":["prod_id","id","productid"],
-    "description":["desc","product_desc","name"],
-    "attributes_raw":["attributes","attr_map","attr_codes"]
-})
-if "attributes_raw" not in mst.columns: mst["attributes_raw"] = ""
-
-# Explode attributes
-rows=[]
-for _, r in mst.iterrows():
-    for token in re.split(r"[;,\|]+", str(r["attributes_raw"])):
-        if ":" in token:
-            aid,val = token.split(":",1)
-            rows.append({"product_id":r["product_id"],"attr_id":aid.strip(),"value_code":val.strip()})
-mst_long = pd.DataFrame(rows)
-
-print("Exploded attribute pairs:", len(mst_long))
-mst_long.head(5)
-
-# Frequency plot
-mst_long["attr_id"].value_counts().head(20).plot(kind="barh", figsize=(8,6))
-plt.title("Top attributes by frequency")
-plt.show()
-
-
-# ====================================================
-# STEP 8. Analyze Dictionary
-# ====================================================
-attr_name = {}
-value_map = {}
-dict_conflicts = []
-
-for e in J.get("dict", []):
-    aid = e.get("id")
-    if not aid: continue
-    attr_name[aid] = e.get("sl") or e.get("name") or e.get("label")
-    for it in find_values_list(e):
-        code,val = pick_code(it), pick_value(it)
-        if code and val:
-            if (aid,str(code)) in value_map and value_map[(aid,str(code))]!=val:
-                dict_conflicts.append({"attr_id":aid,"value_code":code,"a":value_map[(aid,str(code))],"b":val})
-            value_map[(aid,str(code))]=val
-
-print("Attributes defined:", len(attr_name))
-print("Dictionary conflicts:", len(dict_conflicts))
-pd.DataFrame(dict_conflicts).head(5)
-
-# ====================================================
-# STEP 9. Join Analysis
-# ====================================================
-ocr_p = set(ocr["product_id"])
-mst_p = set(mst_long["product_id"])
-both = len(ocr_p & mst_p)
-
-print("Products only in OCR:", len(ocr_p - mst_p))
-print("Products only in Master:", len(mst_p - ocr_p))
-print("Products in both:", both)
-
-# Mapping coverage
-mst_long["value_label"] = mst_long.apply(lambda r: value_map.get((r["attr_id"], str(r["value_code"])), pd.NA), axis=1)
-missing = mst_long[mst_long["value_label"].isna()]
-print("Missing dictionary mappings:", len(missing))
-missing.groupby("attr_id").size().sort_values(ascending=False).head(10)
-
-
-# ====================================================
-# STEP 10. Build Scorecard
-# ====================================================
-completeness = 100 - (100 * (ocr["ocr_text"].astype(str).str.strip()=="").sum() / len(ocr))
-uniqueness = 100 - (100 * mst.duplicated("product_id").sum() / len(mst))
-validity = 100 - (100 * len(missing) / max(1,len(mst_long)))
-consistency = 100 - (100 * len(dict_conflicts) / max(1,len(mst_long)))
-
-scorecard = pd.DataFrame([
-    {"dimension":"Completeness (OCR text present)", "score": round(completeness,2)},
-    {"dimension":"Uniqueness (Master product_id)", "score": round(uniqueness,2)},
-    {"dimension":"Validity (codes→labels coverage)", "score": round(validity,2)},
-    {"dimension":"Consistency (dictionary conflicts low)", "score": round(consistency,2)},
-])
-scorecard["grade"] = pd.cut(scorecard["score"], bins=[-1,60,75,90,100], labels=["Poor","Fair","Good","Excellent"])
-
-scorecard
-
-
-# ====================================================
-# STEP 11. Export Report (Optional)
-# ====================================================
-HTML_TMPL = Template("""
-<h1>Data Quality Report</h1>
-<p>Generated: {{ now }}</p>
-<h2>Scorecard</h2>
-<table border=1>
-<tr><th>Dimension</th><th>Score</th><th>Grade</th></tr>
-{% for r in scorecard %}
-<tr><td>{{ r.dimension }}</td><td>{{ r.score }}</td><td>{{ r.grade }}</td></tr>
-{% endfor %}
-</table>
-""")
-
-html = HTML_TMPL.render(
-    now=datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
-    scorecard=scorecard.to_dict(orient="records")
-)
-
-upload_blob_text(container, "quality_report/dq_report.html", html)
-print("✅ HTML uploaded to container: quality_report/dq_report.html")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# -----------------------------------------------
-# 1. Setup & Azure connection
-# -----------------------------------------------
-import os, io, json, re
-import pandas as pd
-from azure.storage.blob import BlobServiceClient
-
-# Connection string must be set in environment
-CONN_STR = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
-if not CONN_STR:
-    raise RuntimeError("⚠️ Please set AZURE_STORAGE_CONNECTION_STRING")
-
-container = "rawdata"  # adjust if different
-ocr_blob = "OCR_colombia.csv"
-master_blob = "Attributes_definitions.csv"
-dict_blob = "dictionary_co.json"
-
-svc = BlobServiceClient.from_connection_string(CONN_STR)
-
-def read_blob_to_df(container, blob, sep=",", dtype=None):
-    data = svc.get_blob_client(container, blob).download_blob().readall()
-    return pd.read_csv(io.BytesIO(data), sep=sep, dtype=dtype)
-
-def read_blob_to_json(container, blob):
-    data = svc.get_blob_client(container, blob).download_blob().readall()
-    return json.loads(data.decode("utf-8", errors="ignore"))
-
-# -----------------------------------------------
-# 2. Load data
-# -----------------------------------------------
-ocr = read_blob_to_df(container, ocr_blob, dtype={"product_id": str})
-mst = read_blob_to_df(container, master_blob, dtype={"product_id": str})
-dictionary = read_blob_to_json(container, dict_blob)
-
-print("OCR shape:", ocr.shape)
-print("Master shape:", mst.shape)
-print("Dictionary entries:", len(dictionary.get("dict", [])))
-
-ocr.head()
-# -----------------------------------------------
-# 3. Quick sanity checks
-# -----------------------------------------------
-print("OCR unique products:", ocr["product_id"].nunique())
-print("Master unique products:", mst["product_id"].nunique())
-
-print("OCR missing ocr_text:", ocr["ocr_text"].isna().sum())
-print("Master missing attributes_raw:", mst["attributes_raw"].isna().sum())
-
-
-# -----------------------------------------------
-# 4. Parse quantities from OCR text
-# -----------------------------------------------
-SIZE_PATTERNS = [
-    r'(?P<qty>\d+[.,]?\d*)\s?(?P<unit>kg|g|gr|gramos|l|lt|litro|ml|mL)\b',
-    r'(?P<qty>\d+[.,]?\d*)\s?(?P<unit>oz|lb)\b',
-    r'(?P<qty>\d+[.,]?\d*)\s?x\s?(?P<pack>\d+)\b',
-]
-
-def extract_qty(text: str):
-    if not isinstance(text, str):
-        return pd.Series({"qty_value": pd.NA, "qty_unit": pd.NA})
-    t = text.replace(",", ".")
-    for pat in SIZE_PATTERNS:
-        m = re.search(pat, t, flags=re.IGNORECASE)
-        if m and m.groupdict().get("qty") and m.groupdict().get("unit"):
-            try:
-                return pd.Series({"qty_value": float(m.group("qty")), "qty_unit": m.group("unit").lower()})
-            except ValueError:
-                pass
-    return pd.Series({"qty_value": pd.NA, "qty_unit": pd.NA})
-
-def normalize_units(q, u):
-    if pd.isna(q) or not isinstance(u, str): 
-        return pd.NA, pd.NA
-    u = u.lower()
-    if u in ["g","gr","gramos"]: return round(q,3), "g"
-    if u=="kg": return round(q*1000,3), "g"
-    if u in ["ml"]: return round(q,3), "ml"
-    if u in ["l","lt","litro"]: return round(q*1000,3), "ml"
-    if u=="oz": return round(q*28.3495,3), "g"
-    if u=="lb": return round(q*453.592,3), "g"
-    return pd.NA, pd.NA
-
-ocr[["qty_value","qty_unit"]] = ocr["ocr_text"].apply(extract_qty)
-ocr[["qty_std_value","qty_std_unit"]] = ocr.apply(
-    lambda r: normalize_units(r["qty_value"], r["qty_unit"]), axis=1, result_type="expand"
-)
-
-ocr.sample(5)
-
-# -----------------------------------------------
-# 5. Explode Master attributes
-# -----------------------------------------------
-def explode_attributes(attr_str: str):
-    if not isinstance(attr_str, str) or not attr_str.strip(): return []
-    pairs=[]
-    for token in re.split(r"[;,\|]+", attr_str):
-        token = token.strip()
-        if ":" in token:
-            k,v = token.split(":",1)
-            pairs.append((k.strip(), v.strip()))
-    return pairs
-
-rows=[]
-for _,r in mst.iterrows():
-    for aid,val in explode_attributes(r.get("attributes_raw","")):
-        rows.append({"product_id":r["product_id"],"attr_id":aid,"value_code":val})
-mst_long = pd.DataFrame(rows)
-print("Exploded attributes:", mst_long.shape)
-mst_long.head()
-
-
-# -----------------------------------------------
-# 6. Build dictionary maps
-# -----------------------------------------------
-def find_values_list(entry: dict):
-    for k in ["b","values","codes","items","options","map"]:
-        if k in entry and isinstance(entry[k], list):
-            return entry[k]
-    for v in entry.values():
-        if isinstance(v, list) and v and isinstance(v[0], dict):
-            return v
-    return []
-
-def pick_code(d: dict):
-    for k in ["c","code","id","k","key"]:
-        if k in d: return str(d[k])
-    return None
-
-def pick_value(d: dict):
-    for k in ["v","value","label","name","text"]:
-        if k in d: return str(d[k])
-    return None
-
-attr_name = {}
-value_map = {}
-for entry in dictionary.get("dict", []):
-    aid = entry.get("id")
-    aname = entry.get("sl") or entry.get("name") or entry.get("label")
-    if aid: attr_name[aid]=aname
-    for it in find_values_list(entry):
-        code = pick_code(it); val = pick_value(it)
-        if code and val: value_map[(aid,str(code))]=val
-
-len(attr_name), len(value_map)
-
-# -----------------------------------------------
-# 7. Map codes → labels
-# -----------------------------------------------
-mst_long["attr_name"] = mst_long["attr_id"].map(attr_name)
-mst_long["value_label"] = mst_long.apply(
-    lambda r: value_map.get((r["attr_id"], str(r["value_code"])), pd.NA), axis=1
-)
-
-# Check missing mappings
-missing = mst_long[mst_long["value_label"].isna()]
-print("Missing dictionary mappings:", len(missing))
-missing.head()
-
-
-# -----------------------------------------------
-# 8. Pivot attributes wide
-# -----------------------------------------------
-mst_wide = (
-    mst_long
-    .assign(val = mst_long["value_label"].fillna(mst_long["value_code"]))
-    .pivot_table(index="product_id", columns="attr_id", values="val", aggfunc=lambda x: ";".join(sorted(set(map(str,x)))))
-    .reset_index()
-)
-mst_wide.columns = [f"attr_{c}" if c!="product_id" else "product_id" for c in mst_wide.columns]
-mst_wide.head()
-# -----------------------------------------------
-# 9. Final join: OCR + Masterwide
-# -----------------------------------------------
-final = (
-    mst[["product_id","description"]].drop_duplicates()
-    .merge(ocr[["product_id","ocr_text","qty_value","qty_unit","qty_std_value","qty_std_unit"]],
-           on="product_id", how="left")
-    .merge(mst_wide, on="product_id", how="left")
-)
-
-print("Final dataset shape:", final.shape)
-final.head(10)
-# -----------------------------------------------
-# 10. Save back to Azure
-# -----------------------------------------------
-out_path = "processed/training_products_wide.csv"
-buf = io.StringIO()
-final.to_csv(buf, index=False)
-svc.get_blob_client(container, out_path).upload_blob(buf.getvalue().encode("utf-8"), overwrite=True)
-
-print(f"✅ Final training dataset written to {container}/{out_path}")
-
-
-
-
-
-
-
-📓 Notebook: retail_data_quality_and_eda.ipynb
-
-
-# ====================================================
-# STEP 2. Completeness Checks
-# ====================================================
-missing = df.isna().mean().sort_values(ascending=False)*100
-print("Percentage missing values per column:")
-display(missing)
-
-# Empty OCR text or brand
-empty_ocr = (df["ocr_text"].astype(str).str.strip()=="").sum()
-empty_brand = (df["brand"].astype(str).str.strip()=="").sum()
-print(f"Empty OCR text rows: {empty_ocr}")
-print(f"Empty brand rows: {empty_brand}")
-
-# ====================================================
-# STEP 3. Uniqueness & Integrity
-# ====================================================
-dup_products = df.duplicated("product_id").sum()
-dup_rows = df.duplicated().sum()
-print(f"Duplicate product_ids: {dup_products}")
-print(f"Fully duplicate rows: {dup_rows}")
-
-# Check if product_id uniquely identifies a product
-pid_counts = df.groupby("product_id").size()
-pid_counts.describe()
-
-# ====================================================
-# STEP 4. Validity & Ranges
-# ====================================================
-# Standardized quantity checks
-invalid_qty = df[df["qty_std_value"].fillna(0) <= 0]
-outliers = df[df["qty_std_value"] > df["qty_std_value"].quantile(0.99)]
-
-print("Invalid quantities:", len(invalid_qty))
-print("Extreme outliers (top 1%):", len(outliers))
-
-# Allowed units check
-print("Unique units found:", df["qty_std_unit"].unique())
-
-# ====================================================
-# STEP 5. Consistency
-# ====================================================
-# Same product_id with multiple brands/categories
-brand_conflicts = df.groupby("product_id")["brand"].nunique()
-brand_conflicts = brand_conflicts[brand_conflicts > 1]
-
-cat_conflicts = df.groupby("product_id")["category"].nunique()
-cat_conflicts = cat_conflicts[cat_conflicts > 1]
-
-print("Conflicting brand assignments:", len(brand_conflicts))
-print("Conflicting category assignments:", len(cat_conflicts))
-
-#EDA
-# ====================================================
-# STEP 6. Brand vs Category Landscape
-# ====================================================
-brand_cat = df.groupby(["category","brand"]).size().reset_index(name="count")
-pivot = brand_cat.pivot(index="category", columns="brand", values="count").fillna(0)
-
-plt.figure(figsize=(14,8))
-sns.heatmap(pivot, cmap="YlGnBu", linewidths=.5)
-plt.title("Brand vs Category Heatmap (Product Counts)")
-plt.show()
-# ====================================================
-# STEP 7. Pack Size Strategy
-# ====================================================
-plt.figure(figsize=(10,6))
-sns.histplot(data=df, x="qty_std_value", hue="category", multiple="stack", bins=40)
-plt.title("Distribution of Pack Sizes by Category")
-plt.xlabel("Standardized Quantity (g/ml)")
-plt.show()
-
-# Boxplot to compare pack size strategies by brand
-plt.figure(figsize=(14,6))
-sns.boxplot(data=df, x="brand", y="qty_std_value")
-plt.xticks(rotation=90)
-plt.title("Brand Pack Size Strategy")
-plt.show()
-# ====================================================
-# STEP 8. Consumer Language (OCR Text Analysis)
-# ====================================================
-# Text length
-df["ocr_len"] = df["ocr_text"].fillna("").astype(str).str.len()
-sns.histplot(df["ocr_len"], bins=50)
-plt.title("Distribution of OCR Text Length")
-plt.show()
-
-# WordCloud of consumer-facing text
-text_blob = " ".join(df["ocr_text"].fillna("").astype(str).tolist())
-wc = WordCloud(width=800, height=400, background_color="white", colormap="viridis").generate(text_blob)
-
-plt.figure(figsize=(14,6))
-plt.imshow(wc, interpolation="bilinear")
-plt.axis("off")
-plt.title("Consumer Language Word Cloud from OCR")
-plt.show()
-
-# ====================================================
-# STEP 9. Clustering SKUs by Size & Category
-# ====================================================
-from sklearn.preprocessing import StandardScaler
-from sklearn.cluster import KMeans
-
-X = df[["qty_std_value"]].fillna(0)
-X_scaled = StandardScaler().fit_transform(X)
-
-kmeans = KMeans(n_clusters=4, random_state=42, n_init="auto").fit(X_scaled)
-df["size_cluster"] = kmeans.labels_
-
-sns.boxplot(data=df, x="size_cluster", y="qty_std_value")
-plt.title("Clustering of SKUs by Pack Size")
-plt.show()
-# ====================================================
-# STEP 10. Duplicate / Near-duplicate Detection
-# ====================================================
-# Group by brand + category + standardized size
-dup_groups = df.groupby(["brand","category","qty_std_value"]).size().reset_index(name="count")
-dup_groups = dup_groups[dup_groups["count"]>1]
-
-print("Potential duplicate SKUs (same brand/category/size):")
-display(dup_groups.head(10))
-# ====================================================
-# STEP 11. Assortment Gap Analysis
-# ====================================================
-# Expected sizes (e.g., 250, 500, 1000 ml/g)
-expected_sizes = [250, 500, 1000]
-gap_report = []
-
-for cat in df["category"].unique():
-    sizes = df[df["category"]==cat]["qty_std_value"].dropna().astype(int).unique()
-    missing = [s for s in expected_sizes if s not in sizes]
-    if missing:
-        gap_report.append({"category": cat, "missing_sizes": missing})
-
-pd.DataFrame(gap_report)
-# ====================================================
-# STEP 12. Quality Scorecard
-# ====================================================
-scorecard = pd.DataFrame([
-    {"dimension":"Completeness (non-missing OCR/brand)", 
-     "score": round(100*(1-(empty_ocr+empty_brand)/len(df)),2)},
-    {"dimension":"Uniqueness (no duplicate product_ids)", 
-     "score": round(100*(1-dup_products/len(df)),2)},
-    {"dimension":"Validity (reasonable sizes, units)", 
-     "score": round(100*(1-len(invalid_qty)/len(df)),2)},
-    {"dimension":"Consistency (no brand/category conflicts)", 
-     "score": round(100*(1-(len(brand_conflicts)+len(cat_conflicts))/len(df)),2)},
-])
-scorecard["grade"] = pd.cut(scorecard["score"], bins=[-1,60,75,90,100], labels=["Poor","Fair","Good","Excellent"])
-scorecard
-# ====================================================
-# STEP 13. Executive Recommendations
-# ====================================================
 print("""
-🔑 Recommendations:
-
-1. **Data Hygiene**
-   - Normalize brand and category spellings ("Nestle" vs "Nestlé").
-   - Standardize pack sizes into g/ml.
-
-2. **Consumer Insights**
-   - Brands X and Y dominate in smaller packs (impulse buys).
-   - Categories A and B missing mid-size packs → opportunity for new SKUs.
-
-3. **Portfolio Optimization**
-   - Remove duplicate SKUs (same brand/category/size) to reduce cannibalization.
-   - Expand assortment in identified gap sizes (e.g., 500ml in juices).
-
-4. **Marketing / Positioning**
-   - OCR analysis shows strong health-related terms ("light", "sugar-free") — can be leveraged in campaigns.
-   - Word cloud highlights consumer-facing differentiation language.
-
-5. **Future AI Applications**
-   - Cleaned dataset can power recommendation engines (right pack for right consumer).
-   - Predictive models to optimize price-pack architecture and promotions.
+Key takeaways (domain guidance):
+1) Unit normalization: Majority units are 'gr'/'ml' with some 'kg','lt','un'. Normalize to grams/ml for modeling and rule checks.
+2) Brand canonicalization needed: Multiple spellings and accents inflate class space; clean before modeling.
+3) Attribute richness is uneven across SKUs; set PoC scope to high-coverage attributes (Sector/Category/Brand/Size).
+4) Quantity inconsistencies exist vs attribute_value (e.g., 'Gramos:500'); implement consistency rules and flag for human QA.
+5) Long-tail: A small head of classes covers most volume; use class weights and focus evaluation on high-support classes first.
+6) Leakage risk: near-duplicate descriptions exist; ensure splits by product family/brand to avoid optimistic metrics.
 """)
-# ====================================================
-# STEP 14. Shelf View Simulation
-# ====================================================
-# Simplify view: brand, category, standardized pack size
-shelf = df[["brand","category","qty_std_value","qty_std_unit"]].copy()
-shelf["size_label"] = shelf["qty_std_value"].astype(str) + shelf["qty_std_unit"]
-
-# Sample: show "Juice" category assortment
-cat_focus = "Juice"   # <-- change category here
-shelf_view = shelf[shelf["category"]==cat_focus].drop_duplicates()
-
-# Pivot for a shelf-like view (brands x sizes)
-pivot = shelf_view.pivot_table(index="brand", columns="size_label", values="category", aggfunc="count", fill_value=0)
-
-plt.figure(figsize=(12,6))
-sns.heatmap(pivot, cmap="Greens", annot=True, fmt="d", cbar=False)
-plt.title(f"Shelf View – Assortment Variety in {cat_focus}")
-plt.xlabel("Pack Size")
-plt.ylabel("Brand")
-plt.show()
-# ====================================================
-# STEP 15. Variety Index (How a shopper perceives assortment breadth)
-# ====================================================
-# Variety = number of distinct pack sizes per brand in each category
-variety = shelf.groupby(["category","brand"])["size_label"].nunique().reset_index(name="variety_index")
-
-plt.figure(figsize=(14,6))
-sns.barplot(data=variety, x="brand", y="variety_index", hue="category")
-plt.xticks(rotation=90)
-plt.title("Perceived Variety Index (Distinct Pack Sizes per Brand/Category)")
-plt.ylabel("Distinct Pack Sizes")
-plt.show()
-# ====================================================
-# STEP 16. Premium vs Value Positioning
-# ====================================================
-# Heuristic: small packs (<300g/ml) = premium / impulse
-#             large packs (>750g/ml) = value / family
-df["positioning"] = pd.cut(df["qty_std_value"], bins=[0,300,750,5000], labels=["Premium/Impulse","Mid-size","Value/Family"])
-
-pos = df.groupby(["brand","positioning"]).size().reset_index(name="count")
-
-plt.figure(figsize=(12,6))
-sns.barplot(data=pos, x="brand", y="count", hue="positioning")
-plt.xticks(rotation=90)
-plt.title("Brand Positioning by Pack Size Segment")
-plt.ylabel("Number of SKUs")
-plt.show()
-# ====================================================
-# STEP 17. Shopper Language Simulation
-# ====================================================
-# Keywords shoppers actually see on pack (OCR text)
-keywords = ["light","diet","organic","sugar","natural","protein","zero"]
-for word in keywords:
-    df[word+"_flag"] = df["ocr_text"].fillna("").str.lower().str.contains(word)
-
-# % of SKUs per brand carrying each keyword
-keyword_summary = df.groupby("brand")[[w+"_flag" for w in keywords]].mean()*100
-
-plt.figure(figsize=(14,6))
-sns.heatmap(keyword_summary, annot=True, cmap="Blues", fmt=".1f")
-plt.title("Shopper Messaging in OCR (percentage of SKUs per brand)")
-plt.xlabel("Keyword")
-plt.ylabel("Brand")
-plt.show()
-# ====================================================
-# STEP 18. Shelf Gap Analysis (Consumer Opportunities)
-# ====================================================
-expected_sizes = [250, 500, 1000]
-gap_report = []
-
-for brand in df["brand"].unique():
-    brand_sizes = df[df["brand"]==brand]["qty_std_value"].dropna().astype(int).unique()
-    missing = [s for s in expected_sizes if s not in brand_sizes]
-    if missing:
-        gap_report.append({"brand": brand, "missing_sizes": missing})
-
-gap_df = pd.DataFrame(gap_report)
-gap_df
