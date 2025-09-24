@@ -560,3 +560,287 @@ print(f"- Category→Sector hierarchy violations: {len(hier_viol):,} rows → fi
 print("- Brand & Category cleaning: normalize accents/case; collapse variants (e.g., 'coca cola' vs 'coca-cola').")
 print("- Recommend gating PoC on attributes with strong support (Sector, Category, Brand, Size) and clear business value.")
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# =========================
+# Imports & small helpers
+# =========================
+import pandas as pd
+import numpy as np
+import re
+import unicodedata
+import matplotlib.pyplot as plt
+from itertools import chain
+from IPython.display import display
+
+pd.set_option("display.max_columns", None)
+pd.set_option("display.width", 180)
+
+def strip_accents(s):
+    if pd.isna(s): return s
+    return "".join(c for c in unicodedata.normalize("NFD", str(s)) if unicodedata.category(c) != "Mn")
+
+def hist(series, bins=60, title="", xlim=None):
+    plt.figure(figsize=(10,4))
+    plt.hist(series.dropna(), bins=bins)
+    if xlim: plt.xlim(*xlim)
+    plt.title(title)
+    plt.tight_layout()
+    plt.show()
+
+def barh(series, title="", top=None, figsize=(10,6)):
+    s = series.copy()
+    if top is not None:
+        s = s.head(top)
+    plt.figure(figsize=figsize)
+    s.plot.barh()
+    plt.title(title)
+    plt.tight_layout()
+    plt.show()
+
+def show(obj, title=None):
+    if title:
+        print(f"\n=== {title} ===")
+    display(obj)
+
+def headcount_to_cover(series, pct=0.80):
+    if len(series) == 0: return 0
+    cum = series.cumsum() / series.sum()
+    return int((cum <= pct).sum())
+
+# -------------------------------------------------------------------
+# Assumes your DataFrame is in variable `df`
+# -------------------------------------------------------------------
+assert isinstance(df, pd.DataFrame), "Expected your DataFrame in variable `df`"
+
+# =========================
+# 2) Description, Category, Brand quality
+# =========================
+# Normalize description whitespace
+df["desc"] = (df["1"].astype(str)
+                .str.replace("\u00A0", " ", regex=False)
+                .str.replace(r"\s+", " ", regex=True)
+                .str.strip())
+
+df["desc_len"] = df["desc"].str.len()
+hist(df["desc_len"], bins=60, title="Description length distribution")
+
+# Brand cleanliness
+df["brand_raw"]   = df["brand"].astype(str)
+df["brand_clean"] = (df["brand_raw"].str.lower().str.strip()
+                                    .map(strip_accents)
+                                    .str.replace(r"[^a-z0-9 &\-\./]", "", regex=True)
+                                    .str.replace(r"\s+", " ", regex=True)
+                                    .str.strip())
+brand_counts = df["brand_clean"].replace({"nan": np.nan}).value_counts(dropna=True)
+
+barh(brand_counts, "Top 20 brands (cleaned)", top=20)
+
+# Category cleanliness
+if "category" in df.columns:
+    df["category_clean"] = (df["category"].astype(str)
+                            .str.lower().str.strip()
+                            .map(strip_accents)
+                            .str.replace(r"\s+", " ", regex=True))
+    cat_counts = df["category_clean"].replace({"nan": np.nan}).value_counts(dropna=True)
+    barh(cat_counts, "Top 20 categories (cleaned)", top=20)
+else:
+    cat_counts = pd.Series(dtype=int)
+
+# Brand duplication examples (same brand with many spellings)
+brand_variants = (
+    df.groupby(["brand_clean"])["brand_raw"]
+      .apply(lambda s: list(pd.Series(s.unique()).head(5)))
+      .reset_index()
+      .rename(columns={"brand_raw":"sample_variants"})
+)
+show(brand_variants.head(20), title="Brand spelling variants (sample)")
+
+# =========================
+# 3) Quantity & Unit analysis (+ normalization readiness)
+# =========================
+# Coerce numeric Quantity and use Unit as-is; also consider qty_value/qty_unit if present
+df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce")
+if "qty_value" in df.columns:
+    df["qty_value"] = pd.to_numeric(df["qty_value"], errors="coerce")
+if "qty_unit" in df.columns:
+    df["qty_unit"] = df["qty_unit"].astype(str).str.lower()
+
+# Unit distribution
+unit_counts = df["Unit"].astype(str).str.lower().value_counts(dropna=True)
+barh(unit_counts, "Unit distribution", top=15)
+
+# Quantity stats & distribution
+show(df["Quantity"].describe(percentiles=[.25,.5,.75,.95,.99]).to_frame("Quantity stats"),
+     title="Quantity stats")
+hist(df["Quantity"], bins=60, title="Quantity histogram (all)")
+hist(df.loc[df["Quantity"] < 2000, "Quantity"], bins=60, title="Quantity histogram (<2000)")
+
+# Outliers
+qty_out_high = df.loc[df["Quantity"] >= 10000, ["product_id","desc","Quantity","Unit"]].head(20)
+qty_out_low  = df.loc[(df["Quantity"]>0) & (df["Quantity"] < 1), ["product_id","desc","Quantity","Unit"]].head(20)
+show(qty_out_high, title="Potential outliers (Quantity >= 10,000)")
+show(qty_out_low,  title="Potential outliers (0 < Quantity < 1)")
+
+# Consistency check with parsed qty_value/qty_unit when available
+if {"qty_value","qty_unit"}.issubset(df.columns):
+    mismatch_qty = df.loc[
+        (df["qty_value"].notna()) & (df["Quantity"].notna()) &
+        (np.round(df["qty_value"], 3) != np.round(df["Quantity"], 3)),
+        ["product_id","desc","Quantity","Unit","qty_value","qty_unit"]
+    ]
+    print("Qty mismatches (Quantity vs qty_value):", len(mismatch_qty))
+    show(mismatch_qty.sample(min(20, len(mismatch_qty))) if len(mismatch_qty) else mismatch_qty,
+         title="Sample quantity mismatches")
+
+# =========================
+# 4) Attribute coverage & shape
+# =========================
+attr_cols = [c for c in df.columns if str(c).lower().startswith("attribute ") and "value" not in str(c).lower()]
+attr_value_cols = [c for c in df.columns if str(c).lower().startswith("attribute_value ")]
+
+print(f"Detected {len(attr_cols)} attribute slots and {len(attr_value_cols)} attribute_value slots")
+
+# Coverage (# attributes per product)
+df["num_attributes"] = df[attr_cols].notna().sum(axis=1) if attr_cols else 0
+hist(df["num_attributes"], bins=30, title="# Attributes per product")
+
+# Fill % per slot (SAFE calculation)
+n_rows = len(df)
+if attr_cols:
+    cov = (df[attr_cols].notna().mean().mul(100)  # filled %
+           ).sort_values(ascending=False).round(2)
+    barh(cov, "Coverage % by attribute slot", top=len(attr_cols), figsize=(7,10))
+
+if attr_value_cols:
+    cov_val = (df[attr_value_cols].notna().mean().mul(100)  # filled %
+               ).sort_values(ascending=False).round(2)
+    barh(cov_val, "Coverage % by attribute_value slot", top=len(attr_value_cols), figsize=(7,10))
+
+# Most common attribute codes (A####:v) across slots
+if attr_cols:
+    flattened_attrs = pd.Series(list(chain.from_iterable(df[c].dropna().astype(str).tolist() for c in attr_cols)))
+    flattened_attrs = flattened_attrs[flattened_attrs.str.match(r'^[A-Za-z]\d{4}(:.*)?$')]
+    top_attr_codes = flattened_attrs.value_counts().head(30)
+    barh(top_attr_codes, "Top attribute codes across all slots", top=30, figsize=(8,10))
+
+# Parse attribute_value "Label:Value" into columns (left/right) for analysis
+def split_attr_val(s):
+    if pd.isna(s): return pd.Series([np.nan, np.nan])
+    parts = str(s).split(":", 1)
+    if len(parts)==1: return pd.Series([parts[0].strip(), np.nan])
+    return pd.Series([parts[0].strip(), parts[1].strip()])
+
+if attr_value_cols:
+    long_rows = []
+    for col in attr_value_cols:
+        temp = df[[col]].copy()
+        temp[["left","right"]] = temp[col].apply(split_attr_val)
+        temp["slot"] = col
+        long_rows.append(temp[["slot","left","right"]])
+    long_df = pd.concat(long_rows, ignore_index=True)
+    left_counts = long_df["left"].dropna().value_counts().head(30)
+    barh(left_counts, "Top attribute_value 'left' labels (semantic attributes)", top=30, figsize=(8,10))
+    show(long_df.dropna().sample(15, random_state=42), title="Sample parsed attribute_value rows")
+
+# =========================
+# 5) (Optional) Proxies for Sector/Category counts so summary won't error
+#     If you already computed these elsewhere, feel free to remove this section.
+# =========================
+# Sector proxy (from attribute_value if any contains 'sector')
+try:
+    sector_counts = pd.Series(dtype=int)
+    if attr_value_cols:
+        for col in attr_value_cols:
+            left = df[col].str.split(":", n=1).str[0].str.lower()
+            mask = left.str.contains("sector", na=False)
+            vals = df[col].where(mask).dropna().str.split(":", n=1).str[-1]
+            sector_counts = pd.concat([sector_counts, vals]).value_counts()
+except Exception:
+    sector_counts = pd.Series(dtype=int)
+
+# Category counts already built as cat_counts above
+
+# =========================
+# 7) Executive Summary (auto-generated bullets)
+# =========================
+summary = {}
+
+summary["rows"] = int(df.shape[0])
+summary["cols"] = int(df.shape[1])
+
+# Null % — safe calculation
+nulls = df.isna().sum().div(len(df)).mul(100).round(2)
+summary["nulliest_cols"] = nulls.sort_values(ascending=False).head(10).to_dict()
+
+summary["unit_top"] = unit_counts.head(10).to_dict()
+summary["brand_top"] = brand_counts.head(10).to_dict()
+summary["brand_classes"] = int(brand_counts.size)
+summary["brand_long_tail_80pct"] = headcount_to_cover(brand_counts, 0.80) if len(brand_counts) else 0
+summary["quantity_outliers_ge_10000"] = int((df["Quantity"]>=10000).sum())
+summary["quantity_missing_pct"] = float(df["Quantity"].isna().mean()*100)
+
+if len(attr_cols):
+    summary["avg_attributes_per_product"] = float(df["num_attributes"].mean())
+if len(attr_value_cols):
+    summary["attr_value_coverage_median_%"] = float((df[attr_value_cols].notna().mean()*100).median())
+
+if "mismatch_qty" in locals():
+    summary["qty_mismatch_count"] = int(len(mismatch_qty))
+
+if len(sector_counts):
+    summary["sectors_classes"] = int(sector_counts.size)
+    summary["sectors_cover_80"] = headcount_to_cover(sector_counts, 0.80)
+if len(cat_counts):
+    summary["categories_classes"] = int(cat_counts.size)
+    summary["categories_cover_80"] = headcount_to_cover(cat_counts, 0.80)
+
+print("\n===== EXECUTIVE SUMMARY (auto) =====")
+for k,v in summary.items():
+    print(f"- {k}: {v}")
+
