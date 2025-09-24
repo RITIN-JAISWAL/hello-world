@@ -212,23 +212,26 @@ print(mismatches)
 
 
 
-# Function to extract number + unit
-def extract_qty_unit(text):
-    if pd.isna(text):
-        return None
-    s = str(text)
-    # Regex: number + optional decimal + optional space + unit
-    match = re.search(r'(\d+(?:[.,]\d+)?)\s*(gr|g|kg|ml|l|lt|lb)', s, flags=re.IGNORECASE)
-    if match:
-        qty  = match.group(1).replace(",", ".")   # handle commas as decimals
-        unit = match.group(2).lower()
-        return f"{qty} {unit}"
-    return None
+import pandas as pd
+import re
 
-# Apply on column 1 (product description)
-mst["Weight_Unit"] = mst.iloc[:, 1].apply(extract_qty_unit)
+# Clean text (handles non-breaking spaces)
+desc = mst.iloc[:, 1].astype(str).str.replace('\xa0', ' ', regex=False)
 
-# If you also want to split into two separate columns:
-mst["Weight"] = mst["Weight_Unit"].str.extract(r'(\d+(?:\.\d+)?)').astype(float)
-mst["Unit"]   = mst["Weight_Unit"].str.extract(r'([a-zA-Z]+)')
+# Find ALL qty+unit pairs, then keep the last per row
+pat = r'(?i)(\d+(?:[.,]\d+)?)\s*(gr|g|kg|ml|l|lt|lb|lbs)\b'
+all_hits = desc.str.extractall(pat)                 # columns: 0=qty, 1=unit
+last_hits = all_hits.groupby(level=0).tail(1)       # last match per row
+last_hits = last_hits.droplevel(1)                  # drop the match index
+last_hits.columns = ['Weight_raw', 'Unit_raw']
+
+# Attach back, aligned by index
+mst = mst.join(last_hits)
+
+# Normalize
+mst['Weight'] = mst['Weight_raw'].str.replace(',', '.', regex=False).astype(float)
+mst['Unit']   = mst['Unit_raw'].str.lower()
+
+# If you only want the number (like your original):
+# mst['Weight_only'] = mst['Weight']
 
