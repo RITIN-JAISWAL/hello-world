@@ -844,3 +844,499 @@ print("\n===== EXECUTIVE SUMMARY (auto) =====")
 for k,v in summary.items():
     print(f"- {k}: {v}")
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Perfect — now I’ve got a full view of your EDA results and the executive summary.
+Here’s a **presentation-ready summary with key insights and important facts** for tomorrow, structured the way a senior data scientist and retail domain expert would present it:
+
+---
+
+# 📊 Data Quality & EDA Summary (Retail Product Labeling)
+
+### 🔹 Dataset Overview
+
+* **Total records (products):** 310,224
+* **Total columns:** 53
+* **Attribute slots:** 19 (attribute codes)
+* **Attribute value slots:** 19 (semantic descriptors)
+
+---
+
+### 🔹 Missing Data (Nulls)
+
+* High null presence in some fields:
+
+  * **qty\_value & qty\_unit:** \~75% missing → quantity standardization not consistently captured.
+  * **Category & Brand:** \~60% missing → indicates weak metadata assignment.
+  * **Unit:** only \~2.3% missing → relatively well captured.
+* **Action needed:**
+
+  * Enforce stricter capture rules for *brand* and *category*.
+  * Mandatory filling of *qty\_value/unit* fields to support consistency checks.
+
+---
+
+### 🔹 Brand Analysis
+
+* **Unique brands detected:** 7,024
+* Extremely **long-tail distribution**:
+
+  * Top **153 brands cover 80%** of products.
+  * Remaining \~6,800 brands have very sparse representation.
+* **Common brands observed:** Rendy, Hit, Latti, Natura, Alquería, Alpina, Yanbal.
+* **Issue:** >186k rows have **brand missing** → more than half the dataset!
+* **Business risk:** weak brand attribution undermines search, assortment planning, and brand-level reporting.
+
+---
+
+### 🔹 Category Analysis
+
+* **Unique categories detected:** 105
+* **Category concentration:**
+
+  * Top **36 categories cover 80%** of products.
+* Examples of dominant categories:
+
+  * *Papel higiénico, Snacks, Pan industrializado, Galletas, Perfumes/Fragancias, Yogurt/Kumis.*
+* **Category missing:** \~60% of rows.
+* **Risk:** poor categorization → misplacement in e-commerce navigation & analytics blind spots.
+
+---
+
+### 🔹 Quantity & Unit Consistency
+
+* **Quantity distribution:**
+
+  * Most products <2,000 units, but extreme outliers up to **100,000+** detected.
+* **Outliers:**
+
+  * 583 products with **Quantity ≥ 10,000** (likely packaging or entry errors).
+  * \~31k products show **Quantity mismatch vs qty\_value**.
+* **Unit distribution:**
+
+  * Major units: *ml, gr, un*.
+  * But noise categories like *none, “nan”* exist.
+* **Critical inconsistencies:**
+
+  * **38,969 mismatches (Gramos vs Quantity)**
+  * **86,227 mismatches (Mililitros vs Quantity)**
+* **Risk:** these inconsistencies will break pricing-per-unit, pack-size comparisons, and regulatory labeling.
+
+---
+
+### 🔹 Attributes Coverage
+
+* Average attributes per product: **14.1**
+* **Attribute coverage median:** 100% (but only for fields that exist → actual semantics often missing).
+* **Frequent semantic attributes (“left” labels):** Categoría, Envase, Mililitros, Gramos, Presentación, Marca, Sector.
+* Long-tail: niche attributes (Tipo de Fragancia, Tipo de Piel, Nivel Calórico) sparsely filled.
+* **Risk:** incomplete attributes limit filtering (e.g., “low calorie” or “for sensitive skin” queries).
+
+---
+
+### 🔹 Duplicates & Data Leakage
+
+* Near-duplicate product descriptions detected (same product listed multiple times with slight text variation).
+* **Risk:** Duplicate SKUs distort demand forecasting, recommendation systems, and customer search.
+
+---
+
+### 🔹 Executive Summary (Key Stats)
+
+* Rows: **310,224**
+* Nulls (brand, category, qty): **60–75%** missing in critical fields.
+* Brand classes: **7,024**, but **80% covered by only 153 brands**.
+* Category classes: **105**, but **80% covered by only 36 categories**.
+* Quantity mismatches: **\~120k total** (grams + ml inconsistencies).
+* Outliers: **583 products ≥10,000 units**.
+* Duplicate product\_id rows: **\~92k**
+
+---
+
+# 📌 Recommendations
+
+1. **Data Capture Standards**
+
+   * Make *brand* and *category* mandatory fields.
+   * Standardize *qty\_value + qty\_unit* for all new entries.
+2. **Brand & Category Master Alignment**
+
+   * Consolidate brand variants (e.g., "Colgate" vs "colgate") into master brand list.
+   * Map missing categories via NLP-based description parsing.
+3. **Quantity Normalization**
+
+   * Create business rules to cap or flag outliers (>10,000).
+   * Reconcile **qty\_value vs Quantity vs Unit** automatically.
+4. **Attribute Enrichment**
+
+   * Drive attribute completion for *Sector, Marca, Envase, Tamaño*.
+   * Use ML/NLP to infer missing attributes from descriptions.
+5. **Duplicate Resolution**
+
+   * De-duplicate using product\_id + normalized description.
+   * Ensure each SKU is uniquely represented in catalog.
+
+---
+
+👉 This narrative positions your EDA findings in **business terms** (impact on e-commerce, assortment, pricing, reporting) — not just stats.
+
+Would you like me to also **draft presentation slides (PowerPoint-style with visuals + bullet points)** summarizing these findings, so you can walk through them tomorrow?
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# =============================
+# STAGES 5 → 8: Labeling POC
+# =============================
+import pandas as pd
+import numpy as np
+import re
+import os
+import io
+from collections import Counter
+
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.preprocessing import FunctionTransformer, StandardScaler, OneHotEncoder, LabelEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics import classification_report, f1_score, confusion_matrix, accuracy_score
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import LinearSVC
+from scipy import sparse
+import joblib
+
+# ------------------------------------------------------------------
+# Small helpers
+# ------------------------------------------------------------------
+def clean_text(s):
+    if pd.isna(s): return ""
+    s = str(s).lower()
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+def drop_near_dups(df, text_col="desc", pid_col="product_id"):
+    # very light de-dupe: normalize text and keep first instance
+    norm = df[text_col].astype(str).str.lower().str.replace(r"[^a-z0-9 ]"," ", regex=True).str.replace(r"\s+"," ", regex=True).str.strip()
+    deduped = df.loc[~norm.duplicated(keep="first")].copy()
+    return deduped
+
+def topk(series: pd.Series, k=10):
+    return series.value_counts().head(k)
+
+def filter_min_support(df, y_col, min_count=200):
+    vc = df[y_col].value_counts()
+    keep = vc[vc >= min_count].index
+    return df[df[y_col].isin(keep)].copy(), keep
+
+def print_header(title):
+    print("\n" + "="*len(title))
+    print(title)
+    print("="*len(title))
+
+# ------------------------------------------------------------------
+# Stage 5: Target curation & split
+# ------------------------------------------------------------------
+# Build targets
+df_stage = df.copy()
+
+# Targets (choose one label source each; tweak if you want different proxies)
+df_stage["y_brand"]    = df_stage["brand_clean"].replace({"nan": np.nan})
+df_stage["y_category"] = df_stage["y_category_raw"].fillna(df_stage.get("category_clean"))
+# y_sector_raw looks like "Sector: Bebidas" or similar → keep right side if present
+def right_after_colon(x):
+    if pd.isna(x): return np.nan
+    parts = str(x).split(":", 1)
+    return parts[-1].strip() if len(parts) == 2 else str(x).strip()
+
+df_stage["y_sector"]   = df_stage["y_sector_raw"].apply(right_after_colon)
+
+# Minimal text cleaning
+df_stage["desc"] = df_stage["desc"].apply(clean_text)
+
+# Optional: de-duplicate by normalized desc to avoid leakage
+df_stage = drop_near_dups(df_stage, text_col="desc", pid_col="product_id")
+
+# Choose which targets to train in this POC
+TARGETS = {
+    "sector":   "y_sector",
+    "category": "y_category",
+    "brand":    "y_brand",
+}
+
+# Stage 5 – per-target filtering, label encoding, and stratified split
+MIN_SUPPORT = {
+    "sector":   200,   # tune by coverage
+    "category": 300,
+    "brand":    500,
+}
+
+splits = {}   # store all objects per target
+
+for name, ycol in TARGETS.items():
+    print_header(f"Stage 5: Preparing target = {name} ({ycol})")
+    sub = df_stage.loc[df_stage[ycol].notna(), ["product_id","desc","Quantity","Unit", ycol]].copy()
+    # quantity to numeric
+    sub["Quantity"] = pd.to_numeric(sub["Quantity"], errors="coerce")
+    sub["Unit"] = sub["Unit"].astype(str).str.lower()
+
+    # filter low-support classes
+    sub_filt, kept_labels = filter_min_support(sub, ycol, min_count=MIN_SUPPORT[name])
+    print(f"Kept {len(kept_labels)} classes for {name} (min_count={MIN_SUPPORT[name]}). "
+          f"Dropped {(sub[ycol].nunique()-len(kept_labels))} rare classes.")
+
+    # label encode
+    le = LabelEncoder()
+    y = le.fit_transform(sub_filt[ycol])
+    X = sub_filt.drop(columns=[ycol])
+
+    # stratified split
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+
+    splits[name] = {
+        "X_train": X_train, "X_test": X_test,
+        "y_train": y_train, "y_test": y_test,
+        "label_encoder": le,
+        "ycol": ycol
+    }
+    print(f"Train: {X_train.shape}, Test: {X_test.shape}")
+
+# ------------------------------------------------------------------
+# Stage 6: Features (TF-IDF desc + scaled Quantity + one-hot Unit)
+# ------------------------------------------------------------------
+# Column selectors
+TEXT_COL = "desc"
+NUM_COLS = ["Quantity"]
+CAT_COLS = ["Unit"]
+
+text_vect = TfidfVectorizer(
+    ngram_range=(1,2),
+    min_df=5,
+    max_df=0.9,
+    strip_accents="unicode",
+    sublinear_tf=True
+)
+
+preprocess = ColumnTransformer(
+    transformers=[
+        ("tfidf", text_vect, TEXT_COL),
+        ("num",   Pipeline([("scaler", StandardScaler(with_mean=False))]), NUM_COLS),
+        ("unit",  OneHotEncoder(handle_unknown="ignore"), CAT_COLS),
+    ],
+    remainder="drop",
+    sparse_threshold=0.3
+)
+
+# Two alternative classifiers; pick one or evaluate both
+clf_logreg = LogisticRegression(
+    max_iter=2000,
+    n_jobs=-1,
+    class_weight="balanced",
+    C=2.0,
+    solver="saga"
+)
+
+clf_linsvc = LinearSVC(
+    class_weight="balanced",
+    C=1.0
+)
+
+def build_pipeline(base_clf="svm"):
+    clf = clf_linsvc if base_clf == "svm" else clf_logreg
+    return Pipeline([
+        ("prep", preprocess),
+        ("clf",  clf)
+    ])
+
+# ------------------------------------------------------------------
+# Stage 7: Train + evaluate (CV & holdout)
+# ------------------------------------------------------------------
+from sklearn.metrics import precision_recall_fscore_support
+
+def evaluate_target(target_name, base_clf="svm", cv_folds=5, prob=False):
+    print_header(f"Stage 7: Train & Evaluate — target={target_name}, model={base_clf}")
+    pack = splits[target_name]
+    X_train, X_test = pack["X_train"], pack["X_test"]
+    y_train, y_test = pack["y_train"], pack["y_test"]
+    le = pack["label_encoder"]
+
+    pipe = build_pipeline(base_clf=base_clf)
+
+    # CV on train
+    skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
+    cv_f1 = cross_val_score(pipe, X_train, y_train, cv=skf, scoring="f1_weighted", n_jobs=-1)
+    print(f"CV weighted-F1 ({cv_folds} folds): mean={cv_f1.mean():.4f}  std={cv_f1.std():.4f}")
+
+    # Fit on full train
+    pipe.fit(X_train, y_train)
+
+    # Holdout test
+    y_pred = pipe.predict(X_test)
+    print("\n-- HOLDOUT RESULTS --")
+    print(f"Accuracy: {accuracy_score(y_test, y_pred):.4f}")
+    print(f"Weighted F1: {f1_score(y_test, y_pred, average='weighted'):.4f}")
+    print(f"Macro F1:    {f1_score(y_test, y_pred, average='macro'):.4f}")
+
+    print("\nTop confusion pairs (most confused labels):")
+    cm = confusion_matrix(y_test, y_pred)
+    # show a few biggest off-diagonal errors
+    errs = []
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            if i != j and cm[i,j] > 0:
+                errs.append((cm[i,j], le.classes_[i], le.classes_[j]))
+    errs = sorted(errs, reverse=True)[:10]
+    for c, a, b in errs:
+        print(f"{c:5d}  {a}  →  {b}")
+
+    # Build predictions frame with confidence (if available)
+    Xh = X_test.copy()
+    if hasattr(pipe.named_steps["clf"], "decision_function"):
+        dec = pipe.decision_function(X_test)
+        if dec.ndim == 1:  # binary
+            conf = np.abs(dec)
+            top_idx = (dec > 0).astype(int)
+        else:
+            top_idx = dec.argmax(axis=1)
+            conf = dec.max(axis=1)
+    elif hasattr(pipe.named_steps["clf"], "predict_proba"):
+        proba = pipe.predict_proba(X_test)
+        top_idx = proba.argmax(axis=1)
+        conf = proba.max(axis=1)
+    else:
+        top_idx = y_pred
+        conf = np.ones_like(y_pred, dtype=float)
+
+    pred_labels = le.inverse_transform(top_idx)
+    true_labels = le.inverse_transform(y_test)
+
+    out = Xh[["product_id"]].copy()
+    out["true"] = true_labels
+    out["pred"] = pred_labels
+    out["confidence"] = conf
+    out["correct"] = (out["true"] == out["pred"]).astype(int)
+
+    # Save artifacts
+    os.makedirs("artifacts", exist_ok=True)
+    joblib.dump({"pipeline": pipe, "label_encoder": le}, f"artifacts/{target_name}_model.pkl")
+    out.to_csv(f"artifacts/{target_name}_predictions.csv", index=False)
+
+    # hardest errors for SME review
+    err_df = out.loc[out["correct"] == 0].sort_values("confidence", ascending=False)
+    err_join = err_df.merge(X_test[["product_id","desc","Quantity","Unit"]], on="product_id", how="left")
+    err_join.head(500).to_csv(f"artifacts/{target_name}_errors_top500.csv", index=False)
+
+    print(f"\nSaved: artifacts/{target_name}_model.pkl, "
+          f"artifacts/{target_name}_predictions.csv, "
+          f"artifacts/{target_name}_errors_top500.csv")
+
+    return {"preds": out, "pipe": pipe, "label_encoder": le}
+
+# Train & evaluate the three targets (you can switch to "logreg" to compare)
+res_sector   = evaluate_target("sector",   base_clf="svm", cv_folds=5)
+res_category = evaluate_target("category", base_clf="svm", cv_folds=5)
+res_brand    = evaluate_target("brand",    base_clf="svm", cv_folds=5)
+
+# ------------------------------------------------------------------
+# Stage 8: Inference wrapper (top-k & thresholding)
+# ------------------------------------------------------------------
+def predict_with_threshold(model_pack, df_in, k=3, threshold=None):
+    """
+    Returns top-k predictions with scores; if threshold is set,
+    labels below threshold are replaced with 'OTHER'.
+    """
+    pipe = model_pack["pipeline"]
+    le   = model_pack["label_encoder"]
+
+    # minimal preproc for new data
+    data = df_in.copy()
+    data["desc"] = data["desc"].apply(clean_text)
+    data["Quantity"] = pd.to_numeric(data["Quantity"], errors="coerce")
+    data["Unit"] = data["Unit"].astype(str).str.lower()
+
+    # decision scores or proba
+    if hasattr(pipe.named_steps["clf"], "decision_function"):
+        D = pipe.decision_function(data)
+        if D.ndim == 1:
+            D = np.vstack([-D, D]).T  # binary compat
+        scores = np.sort(D, axis=1)[:, ::-1]
+        idxs   = np.argsort(D, axis=1)[:, ::-1]
+    elif hasattr(pipe.named_steps["clf"], "predict_proba"):
+        P = pipe.predict_proba(data)
+        scores = np.sort(P, axis=1)[:, ::-1]
+        idxs   = np.argsort(P, axis=1)[:, ::-1]
+    else:
+        # fall back to hard predictions
+        yhat = pipe.predict(data)
+        idxs = np.vstack([yhat]).T
+        scores = np.ones((len(yhat), 1))
+
+    topk_labels = np.column_stack([le.classes_[idxs[:,i]] for i in range(min(k, idxs.shape[1]))])
+    topk_scores = scores[:, :min(k, scores.shape[1])]
+
+    # apply threshold → 'OTHER'
+    if threshold is not None:
+        top1 = topk_labels[:,0].astype(object)
+        top1_score = topk_scores[:,0]
+        top1[top1_score < threshold] = "OTHER"
+        topk_labels[:,0] = top1
+
+    return topk_labels, topk_scores
+
+# Example inference on the category model
+cat_pack = joblib.load("artifacts/category_model.pkl")
+topk_labels, topk_scores = predict_with_threshold(cat_pack, splits["category"]["X_test"], k=3, threshold=None)
+
+pred_df = pd.DataFrame({
+    "product_id": splits["category"]["X_test"]["product_id"].values,
+    "pred_top1": topk_labels[:,0],
+    "score_top1": topk_scores[:,0]
+})
+pred_df.head()
