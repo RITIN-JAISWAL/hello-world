@@ -1,44 +1,36 @@
 # -*- coding: utf-8 -*-
 """
 FAST non-LLM pipeline (uses in-memory dataframes `Train` and `Test`)
-
-Assumptions:
-- `Train` and `Test` are pandas DataFrames already in memory.
-- Train has columns: clean_description, Sector, Categoría, Marca, (optional) OCR_Size, OCR_Measure
-- Test  has columns: ocr_text, (optional) Sector, Categoría, Marca, OCR_Size, OCR_Measure
-
-What it does:
-- Trains shared TF-IDF (char-grams) + LinearSVCs (global sector/category + sector-specific category)
-- TEST inference from Test.ocr_text with len>20 filter
-- TRAIN sanity-check inference from Train.clean_description with len>20 filter
-- Handles binary LinearSVC decision_function with two-sided scores fix
-- Extracts brand (dictionary + fuzzy) and quantity/unit (regex + priors)
+- Shared TF-IDF (char-grams) for ALL classifiers (global + sector-specific)
+- One transform per split (TEST/TRAIN); no per-row transforms
+- Binary LinearSVC decision_function fix (d -> [-d,+d])
+- TEST inference from Test.ocr_text (only rows with len>20)
+- TRAIN sanity-check inference from Train.clean_description (len>20)
+- Brand & size extraction included
 """
 
 import os, re, numpy as np, pandas as pd
 from typing import Any, Dict, List, Optional
 from difflib import get_close_matches
+from scipy.sparse import csr_matrix
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.svm import LinearSVC
+from sklearn.metrics import f1_score, accuracy_score
 
-# Set threads for Azure ML nodes (tweak to your vCPU count)
+# Thread caps for Azure ML CPU nodes (tweak to vCPU count)
 os.environ.setdefault("OMP_NUM_THREADS", "8")
 os.environ.setdefault("MKL_NUM_THREADS", "8")
 
-# Optional deps
+# -------- optional deps --------
 try:
     from unidecode import unidecode
 except Exception:
     def unidecode(x): return x
-
 try:
     from rapidfuzz import fuzz, process
     HAVE_RAPIDFUZZ = True
 except Exception:
     HAVE_RAPIDFUZZ = False
-
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.svm import LinearSVC
-from sklearn.metrics import f1_score, accuracy_score
-from scipy.sparse import csr_matrix
 
 # ---------- Cleaning ----------
 NOISE_PATTERNS = [
@@ -89,11 +81,9 @@ def extract_all_sizes(text: str):
     cands = []
     for rx in SIZE_RES:
         for m in rx.finditer(text):
-            num = m.groupdict().get('num')
-            unit = m.group('unit').lower()
+            num = m.groupdict().get('num'); unit = m.group('unit').lower()
             if not num: continue
-            try:
-                val = float(num.replace(',', '.'))
+            try: val = float(num.replace(',', '.'))
             except: continue
             unit = UNIT_MAP.get(unit, unit)
             bias = 0.0
@@ -164,7 +154,7 @@ def pick_brand_with_prior(text: str, brand_main_list, pred_cat, cat_brand_counts
     def score(b, s): return 0.6*(s/100.0) + 0.4*pri.get(b,0.0) + penalty(b)
     return max(cand, key=lambda x: score(x[0], x[1]))[0]
 
-# ---------- Vectorizer (shared) ----------
+# ---------- Vectorizer ----------
 def fit_char_vectorizer(X_text: List[str], min_df=3, max_features=250_000):
     vec = TfidfVectorizer(
         analyzer="char_wb", ngram_range=(3,6),
@@ -175,40 +165,42 @@ def fit_char_vectorizer(X_text: List[str], min_df=3, max_features=250_000):
     return vec, X
 
 def transform_char_vectorizer(vec: TfidfVectorizer, texts: List[str]):
-    X = vec.transform(texts).astype(np.float32, copy=False)
-    return X
+    return vec.transform(texts).astype(np.float32, copy=False)
 
 # ---------- Train global & sector models on SAME feature space ----------
 def train_global_models(train_df: pd.DataFrame):
-    tr_text = train_df["clean_description"].fillna("").astype(str)
+    # IMPORTANT: reset index so group indices are POSITIONS; use .iloc everywhere
+    df = train_df.reset_index(drop=True).copy()
+
+    tr_text = df["clean_description"].fillna("").astype(str)
     combined = build_combined_text(tr_text)
 
     vec, X = fit_char_vectorizer(combined.tolist(), min_df=3, max_features=250_000)
 
-    y_cat = train_df["Categoría"].astype(str).tolist()
-    y_sec = train_df["Sector"].astype(str).tolist()
+    y_cat = df["Categoría"].astype(str).tolist()
+    y_sec = df["Sector"].astype(str).tolist()
 
     cat_clf = LinearSVC(C=5.0, class_weight="balanced", max_iter=6000, tol=2e-4)
     sec_clf = LinearSVC(C=3.0, class_weight="balanced", max_iter=5000, tol=2e-4)
     cat_clf.fit(X, y_cat)
     sec_clf.fit(X, y_sec)
 
-    sec_cat_models = {}
-    for sec, idxs in train_df.groupby("Sector").indices.items():
-        sub = train_df.loc[idxs]
-        if sub["Categoría"].nunique() < 2:
+    sec_cat_models: Dict[str, LinearSVC] = {}
+    for sec, idxs in df.groupby("Sector").indices.items():   # idxs = POSITION array
+        if df.iloc[idxs]["Categoría"].nunique() < 2:
             continue
-        y_sub = sub["Categoría"].astype(str).values
-        X_sub = X[idxs]
+        y_sub = df.iloc[idxs]["Categoría"].astype(str).values
+        X_sub = X[idxs]                                      # safe: positions -> same rows in X
         clf = LinearSVC(C=4.0, class_weight="balanced", max_iter=6000, tol=2e-4)
         clf.fit(X_sub, y_sub)
         sec_cat_models[sec] = clf
 
-    cat2sec = train_df.groupby("Categoría")["Sector"].agg(lambda s: s.value_counts().idxmax()).to_dict()
-    sec2cats = (train_df.groupby("Sector")["Categoría"].apply(lambda s: sorted(s.unique())).to_dict())
+    cat2sec = df.groupby("Categoría")["Sector"].agg(lambda s: s.value_counts().idxmax()).to_dict()
+    sec2cats = df.groupby("Sector")["Categoría"].apply(lambda s: sorted(s.unique())).to_dict()
+
     return vec, cat_clf, sec_clf, sec_cat_models, cat2sec, sec2cats
 
-# ---------- Category ensemble using shared X (with binary fix) ----------
+# ---------- Category ensemble using shared X (binary fix) ----------
 CATEGORY_HINTS = {
     "Café": ["cafe","colcafe","instantaneo","molido"],
     "Chocolate Para Taza / Cocoa": ["chocolate","cocoa","mesa","taza"],
@@ -217,7 +209,7 @@ CATEGORY_HINTS = {
 
 def _binary_two_sided_scores_batch(dec_values: np.ndarray) -> np.ndarray:
     d = np.ravel(dec_values).astype(float)
-    return np.vstack([-d, d]).T  # (n_samples, 2)
+    return np.vstack([-d, d]).T
 
 def category_ensemble_predict_sharedX(
     X: csr_matrix,
@@ -250,10 +242,7 @@ def category_ensemble_predict_sharedX(
         sdec = clf.decision_function(Xs)
         sclasses = list(clf.classes_)
         sindex = {c:j for j,c in enumerate(sclasses)}
-        if np.ndim(sdec) == 1:
-            sfull = _binary_two_sided_scores_batch(sdec)
-        else:
-            sfull = sdec
+        sfull = _binary_two_sided_scores_batch(sdec) if np.ndim(sdec) == 1 else sdec
 
         smean = sfull.mean(axis=1, keepdims=True)
         sstd  = sfull.std(axis=1, keepdims=True) + 1e-6
@@ -280,9 +269,9 @@ def category_ensemble_predict_sharedX(
 
             final[i] = hints_best if hints_best in allowed else chosen
 
+    # fallback (no sector model)
     for i in range(len(final)):
-        if final[i] is not None:
-            continue
+        if final[i] is not None: continue
         sec = sec_pred[i]
         allowed = sec2cats.get(sec, None)
         if not allowed:
@@ -291,8 +280,7 @@ def category_ensemble_predict_sharedX(
             best_c = None; best_val = -1e9
             for c in allowed:
                 gv = gstd_scores[i, gindex[c]] if c in gindex else -1e9
-                if gv > best_val:
-                    best_val, best_c = gv, c
+                if gv > best_val: best_val, best_c = gv, c
             final[i] = best_c if best_c is not None else gclasses[int(np.argmax(gscores[i]))]
     return final
 
@@ -328,9 +316,7 @@ def predict_brand_and_size(train_df: pd.DataFrame, df_to_predict: pd.DataFrame, 
         cands = extract_all_sizes(text_raw)
         if not cands: return (np.nan, np.nan)
         pri = unit_priors.get(cat_lbl, {})
-        def score(c):
-            v,u,b = c
-            return b + 0.6*pri.get(str(u).lower(), 0.0)
+        def score(c): v,u,b = c; return b + 0.6*pri.get(str(u).lower(), 0.0)
         best = max(cands, key=score)
         return (best[0], best[1])
 
@@ -377,10 +363,10 @@ def evaluate_df(df_true: pd.DataFrame, pred_df: pd.DataFrame) -> pd.DataFrame:
 # ===========================
 # USE IN-MEMORY DFS: Train, Test
 # ===========================
-# 1) Train models on Train
+# Train your models
 vec, cat_clf, sec_clf, sec_cat_models, cat2sec, sec2cats = train_global_models(Train)
 
-# 2) TEST inference from Test.ocr_text (len > 20)
+# -------- TEST inference (ocr_text len>20) --------
 mask_test = valid_mask_for_text(Test, "ocr_text", 20)
 Test_valid = Test.loc[mask_test].copy()
 
@@ -396,7 +382,6 @@ sec_final = [cat2sec.get(c, s) for c, s in zip(cat_pred, sec_pred)]
 
 brand_pred, qty_pred, unit_pred = predict_brand_and_size(Train, Test_valid, cat_pred, text_col="ocr_text")
 
-# Full TEST output with NaNs for invalid rows
 out_test = Test.copy()
 for col in ["Pred_Sector","Pred_Categoría","Pred_Marca","Pred_Quantity","Pred_Unit"]:
     out_test[col] = np.nan
@@ -406,7 +391,7 @@ out_test.loc[mask_test, "Pred_Marca"]     = brand_pred
 out_test.loc[mask_test, "Pred_Quantity"]  = qty_pred
 out_test.loc[mask_test, "Pred_Unit"]      = unit_pred
 
-# Optional: evaluate on TEST (only if ground truth exists)
+# Optional metrics on TEST if labels exist
 results_test = evaluate_df(
     Test.loc[mask_test],
     out_test.loc[mask_test, ["Pred_Sector","Pred_Categoría","Pred_Marca","Pred_Quantity","Pred_Unit"]]
@@ -416,7 +401,7 @@ print("\n=== FAST Non-LLM Metrics on TEST (valid subset) ===")
 with pd.option_context('display.max_colwidth', 200):
     print(results_test.to_string(index=False))
 
-# 3) TRAIN sanity-check from Train.clean_description (len > 20)
+# -------- TRAIN sanity-check (clean_description len>20) --------
 mask_train = valid_mask_for_text(Train, "clean_description", 20)
 Train_valid = Train.loc[mask_train].copy()
 
@@ -445,5 +430,5 @@ print("\n=== FAST Non-LLM Metrics on TRAIN (valid subset) ===")
 with pd.option_context('display.max_colwidth', 200):
     print(results_train.to_string(index=False))
 
-# Optionally save:
+# # Optional: save predictions
 # out_test.to_csv("/mnt/data/kantar_predictions_nonllm_ensemble.csv", index=False)
