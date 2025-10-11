@@ -1,37 +1,33 @@
 # -*- coding: utf-8 -*-
 """
-NON-LLM OCR attribute prediction — upgraded end-to-end (binary SVC fix).
+FAST non-LLM pipeline (uses in-memory dataframes `Train` and `Test`)
 
-- Trains Sector & Category from text-only (clean_description) -> avoids leakage
-- Inference uses ONLY ocr_text
-- Sector predicted directly from OCR (clean view)
-- Category via GLOBAL model + SECTOR-SPECIFIC model ENSEMBLE (restricted to sector)
-- Test-Time Augmentation (TTA): clean + soft OCR views blended
-- Top-K category re-rank using tiny keyword hints
-- Final Sector derived from final Category (hierarchy consistency)
-- Brand via dictionary + RapidFuzz fuzzy + category prior + frequent-brand classifier fallback
-- Quantity/Unit via regex++ with multi-candidate selection; safe if OCR_Measure missing
-- Evaluation per target and CSV output
+Assumptions:
+- `Train` and `Test` are pandas DataFrames already in memory.
+- Train has columns: clean_description, Sector, Categoría, Marca, (optional) OCR_Size, OCR_Measure
+- Test  has columns: ocr_text, (optional) Sector, Categoría, Marca, OCR_Size, OCR_Measure
 
-Inputs : /mnt/data/Kantar_train.csv, /mnt/data/Kantar_test.csv
-Output : /mnt/data/kantar_predictions_nonllm_ensemble.csv
-
-Requires:
-    pip install pandas numpy scikit-learn Unidecode rapidfuzz
+What it does:
+- Trains shared TF-IDF (char-grams) + LinearSVCs (global sector/category + sector-specific category)
+- TEST inference from Test.ocr_text with len>20 filter
+- TRAIN sanity-check inference from Train.clean_description with len>20 filter
+- Handles binary LinearSVC decision_function with two-sided scores fix
+- Extracts brand (dictionary + fuzzy) and quantity/unit (regex + priors)
 """
 
-import re
-import numpy as np
-import pandas as pd
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+import os, re, numpy as np, pandas as pd
+from typing import Any, Dict, List, Optional
 from difflib import get_close_matches
 
-# --- Optional deps with graceful fallback ---
+# Set threads for Azure ML nodes (tweak to your vCPU count)
+os.environ.setdefault("OMP_NUM_THREADS", "8")
+os.environ.setdefault("MKL_NUM_THREADS", "8")
+
+# Optional deps
 try:
     from unidecode import unidecode
 except Exception:
-    def unidecode(x): return x  # no-op
+    def unidecode(x): return x
 
 try:
     from rapidfuzz import fuzz, process
@@ -39,23 +35,12 @@ try:
 except Exception:
     HAVE_RAPIDFUZZ = False
 
-from sklearn.model_selection import StratifiedShuffleSplit
-from sklearn.pipeline import Pipeline, FeatureUnion
-from sklearn.preprocessing import FunctionTransformer
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.svm import LinearSVC
 from sklearn.metrics import f1_score, accuracy_score
+from scipy.sparse import csr_matrix
 
-# ---------------------------
-# Paths
-# ---------------------------
-TRAIN_PATH = Path("/content/Kantar_train.csv")
-TEST_PATH  = Path("/content/Kantar_test.csv")
-OUT_PATH   = Path("/content/kantar_predictions_nonllm_ensemble.csv")
-
-# ---------------------------
-# OCR cleaning / normalization
-# ---------------------------
+# ---------- Cleaning ----------
 NOISE_PATTERNS = [
     r"exceso en [a-záéíóúüñ ]+",
     r"cont\.?\s*neto",
@@ -83,37 +68,20 @@ def soft_clean(s: str) -> str:
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
-# Robust normalizer: handles Series, list, ndarray, or scalar
-def normalize_for_model(texts):
-    def norm_one(v):
-        if v is None:
-            s = ""
-        elif isinstance(v, float) and np.isnan(v):
-            s = ""
-        else:
-            s = str(v)
-        s = unidecode(s).lower().strip()
-        return re.sub(r"\s+"," ", s)
-    if isinstance(texts, pd.Series):
-        return texts.fillna("").map(norm_one)
-    elif isinstance(texts, (list, tuple, np.ndarray)):
-        return np.array([norm_one(x) for x in texts], dtype=object)
-    else:
-        return np.array([norm_one(texts)], dtype=object)
+def build_combined_text(series: pd.Series) -> pd.Series:
+    raw = series.fillna("").astype(str)
+    a = raw.map(clean_ocr_for_inference)
+    b = raw.map(soft_clean)
+    return (a + " || " + b).str.strip()
 
-# ---------------------------
-# Size/Unit extraction (regex++) + multi-candidate selection
-# ---------------------------
-UNIT_MAP = {
-    'gr':'g','g':'g','kg':'kg','ml':'ml','l':'L','lt':'L','l.':'L','un':'un','u':'un','oz':'oz','uds':'un'
-}
-SIZE_PATTERNS = [
+# ---------- Size/Unit ----------
+UNIT_MAP = {'gr':'g','g':'g','kg':'kg','ml':'ml','l':'L','lt':'L','l.':'L','un':'un','u':'un','oz':'oz','uds':'un'}
+SIZE_RES = [re.compile(p, re.I) for p in [
     r'(?P<num>\d{1,4}(?:[.,]\d{1,3})?)\s*(?P<unit>kg|g|gr|ml|l|lt|l\.|oz|un|u|uds)\b',
     r'(?P<unit>kg|g|gr|ml|l|lt|l\.|oz|un|u|uds)\s*(?P<num>\d{1,4}(?:[.,]\d{1,3})?)\b',
     r'(?:x|\*)\s*(?P<num>\d{1,3})\s*(?P<unit>un|u|uds)\b',
     r'(?P<num>\d{1,3})\s*(?P<unit>un|u|uds)\b'
-]
-SIZE_RES = [re.compile(p, re.I) for p in SIZE_PATTERNS]
+]]
 KEY_NEAR_RE = re.compile(r'(cont|contenido|neto|peso|volumen)', re.I)
 
 def extract_all_sizes(text: str):
@@ -123,12 +91,10 @@ def extract_all_sizes(text: str):
         for m in rx.finditer(text):
             num = m.groupdict().get('num')
             unit = m.group('unit').lower()
-            if not num:
-                continue
+            if not num: continue
             try:
                 val = float(num.replace(',', '.'))
-            except:
-                continue
+            except: continue
             unit = UNIT_MAP.get(unit, unit)
             bias = 0.0
             if KEY_NEAR_RE.search(text[max(0,m.start()-30): m.end()+30]): bias += 1.0
@@ -138,47 +104,35 @@ def extract_all_sizes(text: str):
 
 def normalize_unit(u: Any) -> Any:
     if isinstance(u, str):
-        u2 = u.strip().lower()
-        return UNIT_MAP.get(u2, u2)
+        return UNIT_MAP.get(u.strip().lower(), u.strip().lower())
     return u
 
-# ---------------------------
-# Brand dictionary + matching
-# ---------------------------
+# ---------- Brand tools ----------
 def normalize_text(s: Any) -> str:
     if not isinstance(s, str): return ""
-    s = s.strip().lower()
-    s = re.sub(r"\s+", " ", s)
-    return s
+    return re.sub(r"\s+"," ", s.strip().lower())
 
 def strip_parentheses_brand(s: str) -> str:
     return re.sub(r'\s*\(.*?\)\s*', '', s or "", flags=re.S)
 
-def build_brand_dictionary(train_df: pd.DataFrame) -> Tuple[List[str], Dict[str, str], List[str]]:
+def build_brand_dictionary(train_df: pd.DataFrame):
     df = train_df.copy()
     df['brand_full'] = df['Marca'].astype(str)
     df['brand_main'] = df['Marca'].astype(str).apply(strip_parentheses_brand)
-
     pool = pd.concat([df['brand_full'], df['brand_main']]).dropna().unique().tolist()
-    normalized = [normalize_text(x) for x in pool if isinstance(x, str) and x.strip()]
-    normalized = list(set(normalized))
+    normalized = list({normalize_text(x) for x in pool if isinstance(x,str) and x.strip()})
     brand_sorted = sorted(normalized, key=len, reverse=True)
-
     canon_map = {}
     for b in brand_sorted:
         mask = df['Marca'].str.lower().str.contains(re.escape(b), regex=True, na=False)
         candidates = df.loc[mask, 'Marca']
         canon_map[b] = candidates.mode().iloc[0] if len(candidates) else b
-
     brand_main_list = sorted(df['brand_main'].dropna().unique().tolist(), key=len, reverse=True)
     return brand_sorted, canon_map, brand_main_list
 
 CAPS_RE = re.compile(r'\b[A-Z][A-Z0-9ÁÉÍÓÚÜÑ\-]{2,}\b')
 
-def find_brand_in_text_exact_or_caps(text: Any,
-                                     brand_sorted: List[str],
-                                     canon_map: Dict[str,str],
-                                     brand_main_list: List[str]) -> Optional[str]:
+def find_brand_in_text_exact_or_caps(text: Any, brand_sorted, canon_map, brand_main_list) -> Optional[str]:
     if not isinstance(text, str) or not text.strip(): return None
     t_norm = normalize_text(text)
     for b in brand_sorted:
@@ -187,20 +141,14 @@ def find_brand_in_text_exact_or_caps(text: Any,
     caps = CAPS_RE.findall(text.upper())
     for token in caps:
         exact = [bm for bm in brand_main_list if bm.upper() == token]
-        if exact:
-            return exact[0]
+        if exact: return exact[0]
     if caps:
         candidate = " ".join(caps)
         match_list = get_close_matches(candidate, [bm.upper() for bm in brand_main_list], n=1, cutoff=0.85)
-        if match_list:
-            return match_list[0].title()
+        if match_list: return match_list[0].title()
     return None
 
-def pick_brand_with_prior(text: str,
-                          brand_main_list: List[str],
-                          pred_cat: str,
-                          cat_brand_counts: Dict[str, Dict[str,float]],
-                          threshold:int=80) -> Optional[str]:
+def pick_brand_with_prior(text: str, brand_main_list, pred_cat, cat_brand_counts, threshold:int=82) -> Optional[str]:
     if not HAVE_RAPIDFUZZ or not isinstance(text,str) or not text.strip():
         return None
     pr = process.extract(text, brand_main_list, scorer=fuzz.partial_ratio, limit=10)
@@ -216,193 +164,143 @@ def pick_brand_with_prior(text: str,
     def score(b, s): return 0.6*(s/100.0) + 0.4*pri.get(b,0.0) + penalty(b)
     return max(cand, key=lambda x: score(x[0], x[1]))[0]
 
-# ---------------------------
-# Models & mappings
-# ---------------------------
-def make_text_clf(max_char_feats=400_000, max_word_feats=200_000, C=6.0, min_df=3):
-    char_vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(3,7),
-                               min_df=min_df, max_features=max_char_feats)
-    word_vec = TfidfVectorizer(analyzer="word", ngram_range=(1,2),
-                               min_df=min_df, max_features=max_word_feats)
-    feats = FeatureUnion([("char", char_vec), ("word", word_vec)])
-    return Pipeline([
-        ("norm", FunctionTransformer(normalize_for_model, validate=False)),
-        ("feats", feats),
-        ("clf", LinearSVC(C=C, class_weight="balanced", max_iter=10000, tol=1e-4))
-    ])
+# ---------- Vectorizer (shared) ----------
+def fit_char_vectorizer(X_text: List[str], min_df=3, max_features=250_000):
+    vec = TfidfVectorizer(
+        analyzer="char_wb", ngram_range=(3,6),
+        min_df=min_df, max_features=max_features,
+        dtype=np.float32
+    )
+    X = vec.fit_transform(X_text).astype(np.float32, copy=False)
+    return vec, X
 
-def train_category_model(train_df: pd.DataFrame):
-    if "clean_description" not in train_df.columns:
-        raise ValueError("Training data must contain 'clean_description'.")
-    X = train_df["clean_description"].fillna("")
-    y = train_df["Categoría"].astype(str)
-    sss = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-    tr_idx, _ = next(sss.split(X, y))
-    cat_clf = make_text_clf(C=6.0, min_df=3)
-    cat_clf.fit(X.iloc[tr_idx], y.iloc[tr_idx])
-    cat2sec = train_df.groupby("Categoría")["Sector"].agg(lambda s: s.value_counts().idxmax()).to_dict()
-    return cat_clf, cat2sec
+def transform_char_vectorizer(vec: TfidfVectorizer, texts: List[str]):
+    X = vec.transform(texts).astype(np.float32, copy=False)
+    return X
 
-def train_sector_model(train_df: pd.DataFrame):
-    X = train_df["clean_description"].fillna("")
-    y = train_df["Sector"].astype(str)
-    sss = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-    tr_idx, _ = next(sss.split(X, y))
-    sec_clf = make_text_clf(max_char_feats=300_000, max_word_feats=150_000, C=3.0, min_df=3)
-    sec_clf.fit(X.iloc[tr_idx], y.iloc[tr_idx])
-    return sec_clf
+# ---------- Train global & sector models on SAME feature space ----------
+def train_global_models(train_df: pd.DataFrame):
+    tr_text = train_df["clean_description"].fillna("").astype(str)
+    combined = build_combined_text(tr_text)
 
-def build_sector_to_categories(train_df: pd.DataFrame) -> Dict[str, List[str]]:
-    return (train_df.groupby("Sector")["Categoría"]
-            .apply(lambda s: sorted(s.unique()))
-            .to_dict())
+    vec, X = fit_char_vectorizer(combined.tolist(), min_df=3, max_features=250_000)
 
-def train_sector_specific_category_models(train_df):
-    models = {}
-    for sec, sub in train_df.groupby("Sector"):
+    y_cat = train_df["Categoría"].astype(str).tolist()
+    y_sec = train_df["Sector"].astype(str).tolist()
+
+    cat_clf = LinearSVC(C=5.0, class_weight="balanced", max_iter=6000, tol=2e-4)
+    sec_clf = LinearSVC(C=3.0, class_weight="balanced", max_iter=5000, tol=2e-4)
+    cat_clf.fit(X, y_cat)
+    sec_clf.fit(X, y_sec)
+
+    sec_cat_models = {}
+    for sec, idxs in train_df.groupby("Sector").indices.items():
+        sub = train_df.loc[idxs]
         if sub["Categoría"].nunique() < 2:
             continue
-        Xs = sub["clean_description"].fillna("")
-        ys = sub["Categoría"].astype(str)
-        clf = make_text_clf(max_char_feats=250_000, max_word_feats=120_000, C=4.0, min_df=2)
-        clf.fit(Xs, ys)
-        models[sec] = clf
-    return models
+        y_sub = sub["Categoría"].astype(str).values
+        X_sub = X[idxs]
+        clf = LinearSVC(C=4.0, class_weight="balanced", max_iter=6000, tol=2e-4)
+        clf.fit(X_sub, y_sub)
+        sec_cat_models[sec] = clf
 
-# ---------------------------
-# Category prediction: ensemble (global + sector model) + TTA + Top-K rerank
-# ---------------------------
+    cat2sec = train_df.groupby("Categoría")["Sector"].agg(lambda s: s.value_counts().idxmax()).to_dict()
+    sec2cats = (train_df.groupby("Sector")["Categoría"].apply(lambda s: sorted(s.unique())).to_dict())
+    return vec, cat_clf, sec_clf, sec_cat_models, cat2sec, sec2cats
+
+# ---------- Category ensemble using shared X (with binary fix) ----------
 CATEGORY_HINTS = {
     "Café": ["cafe","colcafe","instantaneo","molido"],
     "Chocolate Para Taza / Cocoa": ["chocolate","cocoa","mesa","taza"],
     "Jabón En Barra Para Ropa": ["jabon","jabón","ropa","barra","detergente"],
-    # Add more high-support categories here if desired
 }
 
-def _binary_two_sided_scores(sdec, sclasses):
-    """
-    Ensure sector-model scores are per-class even in binary case.
-    For LinearSVC binary, decision_function -> shape (1,), positive for sclasses[1].
-    We map to [-d, +d] aligned with classes order.
-    """
-    d = float(np.ravel(sdec)[0])
-    if len(sclasses) == 2:
-        # convention: score for class 0 = -d, class 1 = +d
-        return np.array([[-d, d]], dtype=float)
-    else:
-        # fall back (unlikely)
-        return np.array([np.ravel(sdec)], dtype=float)
+def _binary_two_sided_scores_batch(dec_values: np.ndarray) -> np.ndarray:
+    d = np.ravel(dec_values).astype(float)
+    return np.vstack([-d, d]).T  # (n_samples, 2)
 
-def sector_ensemble_category_predict(ocrs_clean, ocrs_soft,
-                                     global_cat_clf, sec_pred,
-                                     sec2cats, sec_cat_models):
-    # Global features with TTA (sum of clean+soft)
-    Xg1 = global_cat_clf[:-1].transform(ocrs_clean)
-    Xg2 = global_cat_clf[:-1].transform(ocrs_soft)
-    try:
-        Xg = Xg1 + Xg2
-    except:
-        Xg = Xg1
-    gclf = global_cat_clf.named_steps["clf"]
-    gscores = gclf.decision_function(Xg)
+def category_ensemble_predict_sharedX(
+    X: csr_matrix,
+    raw_soft_text: List[str],
+    sec_pred: List[str],
+    cat_clf: LinearSVC,
+    sec_cat_models: Dict[str, LinearSVC],
+    sec2cats: Dict[str, List[str]]
+):
+    gscores = cat_clf.decision_function(X)
     if gscores.ndim == 1: gscores = gscores.reshape(-1,1)
-    gclasses = list(gclf.classes_)
+    gclasses = list(cat_clf.classes_)
     gindex = {c:i for i,c in enumerate(gclasses)}
 
-    # Per-row z-score
     gmean = gscores.mean(axis=1, keepdims=True)
     gstd  = gscores.std(axis=1, keepdims=True) + 1e-6
     gstd_scores = (gscores - gmean)/gstd
 
-    final = []
-    # Keep Top-K for re-rank
     topk_idx = np.argsort(-gscores, axis=1)[:, :5]
     topk = [[gclasses[j] for j in row] for row in topk_idx]
 
-    for i, sec in enumerate(sec_pred):
+    final = [None]*X.shape[0]
+    sec_pred_arr = np.array(sec_pred)
+
+    for sec, clf in sec_cat_models.items():
+        rows = np.where(sec_pred_arr == sec)[0]
+        if len(rows) == 0: continue
+        Xs = X[rows]
+
+        sdec = clf.decision_function(Xs)
+        sclasses = list(clf.classes_)
+        sindex = {c:j for j,c in enumerate(sclasses)}
+        if np.ndim(sdec) == 1:
+            sfull = _binary_two_sided_scores_batch(sdec)
+        else:
+            sfull = sdec
+
+        smean = sfull.mean(axis=1, keepdims=True)
+        sstd  = sfull.std(axis=1, keepdims=True) + 1e-6
+        sstd_scores = (sfull - smean)/sstd
+
+        allowed = set(sec2cats.get(sec, []))
+        for k, i in enumerate(rows):
+            best_c = None; best_val = -1e9
+            for c in allowed:
+                gv = gstd_scores[i, gindex[c]] if c in gindex else -1e9
+                sv = sstd_scores[k, sindex[c]] if c in sindex else 0.0
+                val = 0.6*gv + 0.4*sv
+                if val > best_val:
+                    best_val, best_c = val, c
+
+            chosen = best_c if best_c is not None else gclasses[int(np.argmax(gscores[i]))]
+
+            raw = raw_soft_text[i]
+            hints_best, best_hits = chosen, -1
+            for c in topk[i]:
+                hits = sum(1 for h in CATEGORY_HINTS.get(c, []) if h in raw)
+                if hits > best_hits:
+                    hints_best, best_hits = c, hits
+
+            final[i] = hints_best if hints_best in allowed else chosen
+
+    for i in range(len(final)):
+        if final[i] is not None:
+            continue
+        sec = sec_pred[i]
         allowed = sec2cats.get(sec, None)
-        sstd_scores = None; sindex = {}
-
-        if sec in sec_cat_models:
-            sclf = sec_cat_models[sec]
-            Xs1 = sclf[:-1].transform([ocrs_clean.iloc[i]])
-            Xs2 = sclf[:-1].transform([ocrs_soft.iloc[i]])
-            try:
-                Xs = Xs1 + Xs2
-            except:
-                Xs = Xs1
-            sdec = sclf.named_steps["clf"].decision_function(Xs)
-            sclasses = list(sclf.named_steps["clf"].classes_)
-            sindex = {c:j for j,c in enumerate(sclasses)}
-            # --- FIX: make per-class scores in binary case ---
-            if np.ndim(sdec) == 1:
-                sfull = _binary_two_sided_scores(sdec, sclasses)
-            else:
-                sfull = sdec
-            smean = sfull.mean(axis=1, keepdims=True)
-            sstd  = sfull.std(axis=1, keepdims=True) + 1e-6
-            sstd_scores = (sfull - smean)/sstd
-
-        # Ensemble within allowed set
         if not allowed:
-            chosen = gclasses[int(np.argmax(gscores[i]))]
+            final[i] = gclasses[int(np.argmax(gscores[i]))]
         else:
             best_c = None; best_val = -1e9
             for c in allowed:
                 gv = gstd_scores[i, gindex[c]] if c in gindex else -1e9
-                sv = (sstd_scores[0, sindex[c]] if (sstd_scores is not None and c in sindex) else 0.0)
-                val = 0.6*gv + 0.4*sv
-                if val > best_val:
-                    best_val, best_c = val, c
-            chosen = best_c if best_c is not None else gclasses[int(np.argmax(gscores[i]))]
+                if gv > best_val:
+                    best_val, best_c = gv, c
+            final[i] = best_c if best_c is not None else gclasses[int(np.argmax(gscores[i]))]
+    return final
 
-        # Tiny keyword re-rank among global Top-K
-        raw = ocrs_soft.iloc[i]
-        hints_best = chosen; best_hits = -1
-        for c in topk[i]:
-            hits = sum(1 for h in CATEGORY_HINTS.get(c, []) if h in raw)
-            if hits > best_hits:
-                hints_best, best_hits = c, hits
-
-        if allowed and hints_best in allowed:
-            final.append(hints_best)
-        else:
-            final.append(chosen)
-
-    return final, gscores, gclasses
-
-# ---------------------------
-# Frequent-brand classifier (fallback, non-LLM)
-# ---------------------------
-def train_freq_brand_clf(train_df: pd.DataFrame):
-    brand_counts = train_df['Marca'].value_counts()
-    freq_brands = set(brand_counts[brand_counts>=30].index)
-    mask = train_df['Marca'].isin(freq_brands)
-    if mask.sum() == 0:
-        return None, set()
-    clf = make_text_clf(max_char_feats=300_000, max_word_feats=150_000, C=3.0, min_df=2)
-    clf.fit(train_df.loc[mask,'clean_description'].fillna(''),
-            train_df.loc[mask,'Marca'].astype(str))
-    return clf, freq_brands
-
-# ---------------------------
-# Predict (non-LLM)
-# ---------------------------
-def predict_nonllm(train_df: pd.DataFrame,
-                   test_df: pd.DataFrame,
-                   cat_clf: Pipeline,
-                   sec_clf: Pipeline,
-                   cat2sec: Dict[str,str],
-                   sec2cats: Dict[str, List[str]],
-                   sec_cat_models: Dict[str, Pipeline],
-                   brand_freq_clf=None,
-                   freq_brand_set: Optional[set]=None) -> pd.DataFrame:
-
+# ---------- Brand & size prediction ----------
+def predict_brand_and_size(train_df: pd.DataFrame, df_to_predict: pd.DataFrame, pred_cat: List[str], text_col: str):
     brand_sorted, canon_map, brand_main_list = build_brand_dictionary(train_df)
     cat_brand_counts = (train_df.groupby(['Categoría','Marca']).size()
                         .groupby(level=0).apply(lambda s: (s/s.sum()).to_dict()).to_dict())
-
-    # Unit priors per category (safe if OCR_Measure missing)
     if "OCR_Measure" in train_df.columns:
         unit_priors = (
             train_df[["Categoría", "OCR_Measure"]]
@@ -415,63 +313,37 @@ def predict_nonllm(train_df: pd.DataFrame,
     else:
         unit_priors = {}
 
-    ocrs_raw   = test_df["ocr_text"].fillna("")
-    ocrs_clean = ocrs_raw.map(clean_ocr_for_inference)
-    ocrs_soft  = ocrs_raw.map(soft_clean)
+    raw_txt = df_to_predict[text_col].fillna("").astype(str).tolist()
 
-    pred_sector_direct = sec_clf.predict(ocrs_clean)
-
-    pred_cat, gscores, gclasses = sector_ensemble_category_predict(
-        ocrs_clean, ocrs_soft, cat_clf, pred_sector_direct, sec2cats, sec_cat_models
-    )
-
-    pred_sec = [cat2sec.get(c, None) for c in pred_cat]
-
-    # Brand with layered strategy
     pred_brand = []
-    for txt_raw, cat_label in zip(ocrs_raw, pred_cat):
+    for txt, cat_label in zip(raw_txt, pred_cat):
         b = None
         if HAVE_RAPIDFUZZ:
-            b = pick_brand_with_prior(txt_raw, brand_main_list, cat_label, cat_brand_counts, threshold=80)
+            b = pick_brand_with_prior(txt, brand_main_list, cat_label, cat_brand_counts, threshold=82)
         if not b:
-            b = find_brand_in_text_exact_or_caps(txt_raw, brand_sorted, canon_map, brand_main_list)
-        if not b and (brand_freq_clf is not None):
-            try:
-                b = brand_freq_clf.predict([clean_ocr_for_inference(txt_raw)])[0]
-                if freq_brand_set and b not in freq_brand_set:
-                    b = None
-            except:
-                b = None
+            b = find_brand_in_text_exact_or_caps(txt, brand_sorted, canon_map, brand_main_list)
         pred_brand.append(b)
 
-    # Quantity/Unit with priors
-    def pick_size_for_category(text_raw: str, pred_cat: str):
+    def pick_size_for_category(text_raw: str, cat_lbl: str):
         cands = extract_all_sizes(text_raw)
         if not cands: return (np.nan, np.nan)
-        pri = unit_priors.get(pred_cat, {})
+        pri = unit_priors.get(cat_lbl, {})
         def score(c):
             v,u,b = c
             return b + 0.6*pri.get(str(u).lower(), 0.0)
         best = max(cands, key=score)
         return (best[0], best[1])
 
-    pred_qty, pred_unit = zip(*[pick_size_for_category(t, c) for t,c in zip(ocrs_raw, pred_cat)])
+    qty, unit = zip(*[pick_size_for_category(t, c) for t, c in zip(raw_txt, pred_cat)])
+    return list(pred_brand), list(qty), list(unit)
 
-    pred = pd.DataFrame({
-        "Pred_Sector":    pred_sec,
-        "Pred_Categoría": pred_cat,
-        "Pred_Marca":     pred_brand,
-        "Pred_Quantity":  list(pred_qty),
-        "Pred_Unit":      list(pred_unit),
-    }, index=test_df.index)
+# ---------- Valid masks ----------
+def valid_mask_for_text(df: pd.DataFrame, text_col: str, min_len: int = 20) -> pd.Series:
+    if text_col not in df.columns:
+        return pd.Series(False, index=df.index)
+    return df[text_col].notna() & (df[text_col].astype(str).str.strip().str.len() > min_len)
 
-    # final pass consistency
-    pred["Pred_Sector"] = pred["Pred_Categoría"].map(cat2sec).fillna(pred["Pred_Sector"])
-    return pred
-
-# ---------------------------
-# Evaluation
-# ---------------------------
+# ---------- Metrics ----------
 def eval_cls(y_true: pd.Series, y_pred: pd.Series, name: str) -> Dict[str, Any]:
     mask = ~pd.isna(y_true)
     if mask.sum() == 0:
@@ -485,62 +357,93 @@ def eval_cls(y_true: pd.Series, y_pred: pd.Series, name: str) -> Dict[str, Any]:
         "n": int(mask.sum())
     }
 
-def evaluate_on_test(test_df: pd.DataFrame, pred: pd.DataFrame) -> pd.DataFrame:
-    results = []
-    results.append(eval_cls(test_df.get("Sector"),    pred["Pred_Sector"],    "Sector"))
-    results.append(eval_cls(test_df.get("Categoría"), pred["Pred_Categoría"], "Categoría"))
-    results.append(eval_cls(test_df.get("Marca"),     pred["Pred_Marca"].fillna("N/A"), "Marca"))
-
-    size_true = pd.to_numeric(test_df.get("OCR_Size", pd.Series(index=test_df.index)), errors='coerce')
-    unit_true = test_df.get("OCR_Measure", pd.Series(index=test_df.index)).apply(normalize_unit)
-
-    size_pred = pd.to_numeric(pred["Pred_Quantity"], errors='coerce')
-    unit_pred = pred["Pred_Unit"].apply(normalize_unit)
-
+def evaluate_df(df_true: pd.DataFrame, pred_df: pd.DataFrame) -> pd.DataFrame:
+    res = []
+    res.append(eval_cls(df_true.get("Sector"),    pred_df["Pred_Sector"],    "Sector"))
+    res.append(eval_cls(df_true.get("Categoría"), pred_df["Pred_Categoría"], "Categoría"))
+    res.append(eval_cls(df_true.get("Marca"),     pred_df["Pred_Marca"].fillna("N/A"), "Marca"))
+    size_true = pd.to_numeric(df_true.get("OCR_Size", pd.Series(index=df_true.index)), errors='coerce')
+    unit_true = df_true.get("OCR_Measure", pd.Series(index=df_true.index)).apply(normalize_unit)
+    size_pred = pd.to_numeric(pred_df["Pred_Quantity"], errors='coerce')
+    unit_pred = pred_df["Pred_Unit"].apply(normalize_unit)
     size_mask = size_true.notna()
     unit_mask = unit_true.notna()
-
     size_acc = float(np.nanmean((size_true[size_mask] == size_pred[size_mask]).astype(float))) if size_mask.any() else np.nan
     unit_acc = float(np.nanmean((unit_true[unit_mask] == unit_pred[unit_mask]).astype(float))) if unit_mask.any() else np.nan
+    res.append({"metric":"Quantity", "accuracy": size_acc, "n": int(size_mask.sum())})
+    res.append({"metric":"Unit",     "accuracy": unit_acc,  "n": int(unit_mask.sum())})
+    return pd.DataFrame(res)
 
-    results.append({"metric":"Quantity", "accuracy": size_acc, "n": int(size_mask.sum())})
-    results.append({"metric":"Unit",     "accuracy": unit_acc,  "n": int(unit_mask.sum())})
-    return pd.DataFrame(results)
+# ===========================
+# USE IN-MEMORY DFS: Train, Test
+# ===========================
+# 1) Train models on Train
+vec, cat_clf, sec_clf, sec_cat_models, cat2sec, sec2cats = train_global_models(Train)
 
-# ---------------------------
-# Main
-# ---------------------------
-def main():
-    if not TRAIN_PATH.exists() or not TEST_PATH.exists():
-        raise FileNotFoundError("Please place Kantar_train.csv and Kantar_test.csv in /mnt/data")
+# 2) TEST inference from Test.ocr_text (len > 20)
+mask_test = valid_mask_for_text(Test, "ocr_text", 20)
+Test_valid = Test.loc[mask_test].copy()
 
-    train_df = pd.read_csv(TRAIN_PATH)
-    test_df  = pd.read_csv(TEST_PATH)
+test_combined = build_combined_text(Test_valid["ocr_text"])
+X_test = transform_char_vectorizer(vec, test_combined.tolist())
 
-    cat_clf, cat2sec = train_category_model(train_df)
-    sec_clf          = train_sector_model(train_df)
-    sec2cats         = build_sector_to_categories(train_df)
-    sec_cat_models   = train_sector_specific_category_models(train_df)
-    brand_freq_clf, freq_brand_set = train_freq_brand_clf(train_df)
+sec_pred = sec_clf.predict(X_test).tolist()
+soft_txt = Test_valid["ocr_text"].fillna("").astype(str).map(soft_clean).tolist()
+cat_pred = category_ensemble_predict_sharedX(
+    X_test, soft_txt, sec_pred, cat_clf, sec_cat_models, sec2cats
+)
+sec_final = [cat2sec.get(c, s) for c, s in zip(cat_pred, sec_pred)]
 
-    pred = predict_nonllm(train_df, test_df,
-                          cat_clf, sec_clf, cat2sec, sec2cats, sec_cat_models,
-                          brand_freq_clf=brand_freq_clf, freq_brand_set=freq_brand_set)
+brand_pred, qty_pred, unit_pred = predict_brand_and_size(Train, Test_valid, cat_pred, text_col="ocr_text")
 
-    results_df = evaluate_on_test(test_df, pred)
+# Full TEST output with NaNs for invalid rows
+out_test = Test.copy()
+for col in ["Pred_Sector","Pred_Categoría","Pred_Marca","Pred_Quantity","Pred_Unit"]:
+    out_test[col] = np.nan
+out_test.loc[mask_test, "Pred_Sector"]    = sec_final
+out_test.loc[mask_test, "Pred_Categoría"] = cat_pred
+out_test.loc[mask_test, "Pred_Marca"]     = brand_pred
+out_test.loc[mask_test, "Pred_Quantity"]  = qty_pred
+out_test.loc[mask_test, "Pred_Unit"]      = unit_pred
 
-    out = test_df.copy()
-    out["Pred_Sector"]    = pred["Pred_Sector"]
-    out["Pred_Categoría"] = pred["Pred_Categoría"]
-    out["Pred_Marca"]     = pred["Pred_Marca"]
-    out["Pred_Quantity"]  = pred["Pred_Quantity"]
-    out["Pred_Unit"]      = pred["Pred_Unit"]
-    out.to_csv(OUT_PATH, index=False)
+# Optional: evaluate on TEST (only if ground truth exists)
+results_test = evaluate_df(
+    Test.loc[mask_test],
+    out_test.loc[mask_test, ["Pred_Sector","Pred_Categoría","Pred_Marca","Pred_Quantity","Pred_Unit"]]
+)
+print(f"\nValid TEST rows (ocr_text len>20): {mask_test.sum()} / {len(Test)}")
+print("\n=== FAST Non-LLM Metrics on TEST (valid subset) ===")
+with pd.option_context('display.max_colwidth', 200):
+    print(results_test.to_string(index=False))
 
-    print("\n=== Non-LLM Metrics (using only ocr_text at inference) ===")
-    with pd.option_context('display.max_colwidth', 200):
-        print(results_df.to_string(index=False))
-    print(f"\nPredictions saved to: {OUT_PATH}")
+# 3) TRAIN sanity-check from Train.clean_description (len > 20)
+mask_train = valid_mask_for_text(Train, "clean_description", 20)
+Train_valid = Train.loc[mask_train].copy()
 
-if __name__ == "__main__":
-    main()
+train_combined = build_combined_text(Train_valid["clean_description"])
+X_train_eval = transform_char_vectorizer(vec, train_combined.tolist())
+
+sec_pred_tr = sec_clf.predict(X_train_eval).tolist()
+soft_txt_tr = Train_valid["clean_description"].fillna("").astype(str).map(soft_clean).tolist()
+cat_pred_tr = category_ensemble_predict_sharedX(
+    X_train_eval, soft_txt_tr, sec_pred_tr, cat_clf, sec_cat_models, sec2cats
+)
+sec_final_tr = [cat2sec.get(c, s) for c, s in zip(cat_pred_tr, sec_pred_tr)]
+brand_pred_tr, qty_pred_tr, unit_pred_tr = predict_brand_and_size(Train, Train_valid, cat_pred_tr, "clean_description")
+
+pred_train_df = pd.DataFrame({
+    "Pred_Sector": sec_final_tr,
+    "Pred_Categoría": cat_pred_tr,
+    "Pred_Marca": brand_pred_tr,
+    "Pred_Quantity": qty_pred_tr,
+    "Pred_Unit": unit_pred_tr
+}, index=Train_valid.index)
+
+results_train = evaluate_df(Train_valid, pred_train_df)
+print(f"\nValid TRAIN rows (clean_description len>20): {mask_train.sum()} / {len(Train)}")
+print("\n=== FAST Non-LLM Metrics on TRAIN (valid subset) ===")
+with pd.option_context('display.max_colwidth', 200):
+    print(results_train.to_string(index=False))
+
+# Optionally save:
+# out_test.to_csv("/mnt/data/kantar_predictions_nonllm_ensemble.csv", index=False)
