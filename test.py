@@ -1,15 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-FAST non-LLM pipeline (uses in-memory dataframes `Train` and `Test`)
-- Shared TF-IDF (char-grams) for ALL classifiers (global + sector-specific)
-- One transform per split (TEST/TRAIN); no per-row transforms
-- Binary LinearSVC decision_function fix (d -> [-d,+d])
-- TEST inference from Test.ocr_text (only rows with len>20)
-- TRAIN sanity-check inference from Train.clean_description (len>20)
-- Brand & size extraction included
+FAST non-LLM pipeline with OCR-like synthetic training text
+- Use in-memory Train, Test DataFrames (no CSV reads here)
+- Train text = synthetic OCR-ized version of clean_description (no label leakage)
+- Vectorizer vocabulary = Train_synth ∪ sample(Train.ocr_text) ∪ Test.ocr_text
+- Rest: shared char TF-IDF, LinearSVC (global + sector-specific), binary fix, ensemble,
+        brand & size extraction, metrics, only Test.ocr_text len>20.
+
+This cell **replaces** train_global_models() to consume OCR-like training text.
 """
 
-import os, re, numpy as np, pandas as pd
+import os, re, random
+import numpy as np, pandas as pd
 from typing import Any, Dict, List, Optional
 from difflib import get_close_matches
 from scipy.sparse import csr_matrix
@@ -21,11 +23,11 @@ from sklearn.metrics import f1_score, accuracy_score
 os.environ.setdefault("OMP_NUM_THREADS", "8")
 os.environ.setdefault("MKL_NUM_THREADS", "8")
 
-# -------- optional deps --------
 try:
     from unidecode import unidecode
 except Exception:
     def unidecode(x): return x
+
 try:
     from rapidfuzz import fuzz, process
     HAVE_RAPIDFUZZ = True
@@ -65,6 +67,76 @@ def build_combined_text(series: pd.Series) -> pd.Series:
     a = raw.map(clean_ocr_for_inference)
     b = raw.map(soft_clean)
     return (a + " || " + b).str.strip()
+
+# ---------- OCR-like synthesizer (NO label strings inserted) ----------
+_unit_variants = {
+    "l": ["l","lt","l.","litro","litros"],
+    "ml": ["ml","m.l","mililitros"],
+    "g": ["g","gr","gramo","gramos"],
+    "kg": ["kg","kilo","kilogramos"],
+    "un": ["un","u","uds","unidad","unid"]
+}
+def _random_unit(u: str) -> str:
+    u = (u or "").strip().lower()
+    if u in _unit_variants: return random.choice(_unit_variants[u])
+    return u
+
+def _jitter_text(t: str) -> str:
+    # light OCR-ish jitter: drop accents (already), collapse/expand spaces, strip punctuation,
+    # swap similar glyphs occasionally (o/0, l/1), random hyphens/dots
+    t = re.sub(r"[,;:]+", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    # small prob glyph noise
+    t = re.sub(r"0", "o", t) if random.random()<0.1 else t
+    t = re.sub(r"o", "0", t) if random.random()<0.05 else t
+    t = re.sub(r"l", "1", t) if random.random()<0.05 else t
+    # spacing noise
+    if random.random()<0.2:
+        t = t.replace(" ", "  ")
+    # random dash/dot injections between tokens
+    if random.random()<0.15:
+        t = re.sub(r"\b(\w{3,})\b", r"\1-", t, count=1)
+    return t
+
+def synth_ocr_like_from_clean_row(row: pd.Series) -> str:
+    """
+    Build a synthetic OCR-like string from clean_description + **non-label** fields.
+    We never include explicit 'Sector' or 'Categoría' text tokens here.
+    """
+    desc = clean_ocr_for_inference(str(row.get("clean_description", "")))
+    brand = str(row.get("Marca","")).strip()
+    size  = row.get("OCR_Size", "")
+    unit  = row.get("OCR_Measure", "")
+    # safe tokens to include: brand, numbers/units, generic cues
+    segs = [desc]
+    if brand:
+        segs.append(brand)
+    # include size/unit as they appear in real OCR
+    if pd.notna(size) or pd.notna(unit):
+        u = _random_unit(str(unit))
+        try:
+            if pd.notna(size) and str(size).strip():
+                # 20% chance to use comma decimal
+                s = str(size)
+                if random.random()<0.2 and "." in s:
+                    s = s.replace(".", ",")
+                segs.append(f"{s} {u}".strip())
+            else:
+                segs.append(u)
+        except Exception:
+            pass
+    # generic OCR markers
+    if random.random()<0.15:
+        segs.append("contenido neto")
+    if random.random()<0.1:
+        segs.append("lote 1234")
+
+    txt = " ".join([x for x in segs if isinstance(x,str) and x.strip()])
+    txt = _jitter_text(txt)
+    return txt
+
+def make_train_synth_text(train_df: pd.DataFrame) -> pd.Series:
+    return train_df.apply(synth_ocr_like_from_clean_row, axis=1)
 
 # ---------- Size/Unit ----------
 UNIT_MAP = {'gr':'g','g':'g','kg':'kg','ml':'ml','l':'L','lt':'L','l.':'L','un':'un','u':'un','oz':'oz','uds':'un'}
@@ -155,11 +227,11 @@ def pick_brand_with_prior(text: str, brand_main_list, pred_cat, cat_brand_counts
     return max(cand, key=lambda x: score(x[0], x[1]))[0]
 
 # ---------- Vectorizer ----------
-def fit_char_vectorizer(X_text: List[str], min_df=3, max_features=250_000):
+def fit_char_vectorizer(X_text: List[str], min_df=3, max_features=300_000):
     vec = TfidfVectorizer(
-        analyzer="char_wb", ngram_range=(3,6),
+        analyzer="char_wb", ngram_range=(3,7),
         min_df=min_df, max_features=max_features,
-        dtype=np.float32
+        dtype=np.float32, sublinear_tf=True, norm="l2"
     )
     X = vec.fit_transform(X_text).astype(np.float32, copy=False)
     return vec, X
@@ -167,46 +239,65 @@ def fit_char_vectorizer(X_text: List[str], min_df=3, max_features=250_000):
 def transform_char_vectorizer(vec: TfidfVectorizer, texts: List[str]):
     return vec.transform(texts).astype(np.float32, copy=False)
 
-# ---------- Train global & sector models on SAME feature space ----------
-def train_global_models(train_df: pd.DataFrame):
-    # IMPORTANT: reset index so group indices are POSITIONS; use .iloc everywhere
+# ---------- Train global & sector models on OCR-like text ----------
+def train_global_models(train_df: pd.DataFrame, test_df: pd.DataFrame,
+                        sample_frac_train_ocr: float = 0.25,
+                        max_vocab_features: int = 350_000):
     df = train_df.reset_index(drop=True).copy()
 
-    tr_text = df["clean_description"].fillna("").astype(str)
-    combined = build_combined_text(tr_text)
+    # 1) Primary training text (one per row): synthetic OCR-like from clean_description (NO label words)
+    train_synth = make_train_synth_text(df)
 
-    vec, X = fit_char_vectorizer(combined.tolist(), min_df=3, max_features=250_000)
+    # 2) Unlabeled pool for vocabulary only: Test.ocr_text + sampled Train.ocr_text (if present)
+    unlabeled = []
+    if "ocr_text" in df.columns:
+        # sample some true OCR to mix into vec.fit
+        tr_ocr = df["ocr_text"].dropna().astype(str)
+        if len(tr_ocr) > 0 and sample_frac_train_ocr>0:
+            unlabeled.append(tr_ocr.sample(frac=min(1.0, sample_frac_train_ocr), random_state=42))
+    if "ocr_text" in test_df.columns:
+        unlabeled.append(test_df["ocr_text"].dropna().astype(str))
+    unlabeled_corpus = pd.concat([train_synth] + unlabeled, axis=0).map(clean_ocr_for_inference)
+
+    # 3) Fit vectorizer on the union (unlabeled), transform train_synth for supervised training
+    vec = TfidfVectorizer(
+        analyzer="char_wb", ngram_range=(3,7),
+        min_df=3, max_features=max_vocab_features,
+        dtype=np.float32, sublinear_tf=True, norm="l2"
+    )
+    vec.fit(unlabeled_corpus.tolist())
+
+    X = vec.transform(train_synth.tolist()).astype(np.float32, copy=False)
 
     y_cat = df["Categoría"].astype(str).tolist()
     y_sec = df["Sector"].astype(str).tolist()
 
-    cat_clf = LinearSVC(C=5.0, class_weight="balanced", max_iter=6000, tol=2e-4)
-    sec_clf = LinearSVC(C=3.0, class_weight="balanced", max_iter=5000, tol=2e-4)
+    cat_clf = LinearSVC(C=5.0, class_weight="balanced", max_iter=8000, tol=2e-4)
+    sec_clf = LinearSVC(C=3.5, class_weight="balanced", max_iter=7000, tol=2e-4)
     cat_clf.fit(X, y_cat)
     sec_clf.fit(X, y_sec)
 
+    # sector-specific models on the same X
     sec_cat_models: Dict[str, LinearSVC] = {}
-    for sec, idxs in df.groupby("Sector").indices.items():   # idxs = POSITION array
+    for sec, idxs in df.groupby("Sector").indices.items():
         if df.iloc[idxs]["Categoría"].nunique() < 2:
             continue
         y_sub = df.iloc[idxs]["Categoría"].astype(str).values
-        X_sub = X[idxs]                                      # safe: positions -> same rows in X
-        clf = LinearSVC(C=4.0, class_weight="balanced", max_iter=6000, tol=2e-4)
+        X_sub = X[idxs]
+        clf = LinearSVC(C=4.0, class_weight="balanced", max_iter=8000, tol=2e-4)
         clf.fit(X_sub, y_sub)
         sec_cat_models[sec] = clf
 
     cat2sec = df.groupby("Categoría")["Sector"].agg(lambda s: s.value_counts().idxmax()).to_dict()
     sec2cats = df.groupby("Sector")["Categoría"].apply(lambda s: sorted(s.unique())).to_dict()
-
     return vec, cat_clf, sec_clf, sec_cat_models, cat2sec, sec2cats
 
-# ---------- Category ensemble using shared X (binary fix) ----------
+# ---------- Category ensemble (binary fix) ----------
 CATEGORY_HINTS = {
     "Café": ["cafe","colcafe","instantaneo","molido"],
     "Chocolate Para Taza / Cocoa": ["chocolate","cocoa","mesa","taza"],
     "Jabón En Barra Para Ropa": ["jabon","jabón","ropa","barra","detergente"],
 }
-
 def _binary_two_sided_scores_batch(dec_values: np.ndarray) -> np.ndarray:
     d = np.ravel(dec_values).astype(float)
     return np.vstack([-d, d]).T
@@ -269,7 +360,6 @@ def category_ensemble_predict_sharedX(
 
             final[i] = hints_best if hints_best in allowed else chosen
 
-    # fallback (no sector model)
     for i in range(len(final)):
         if final[i] is not None: continue
         sec = sec_pred[i]
@@ -284,7 +374,7 @@ def category_ensemble_predict_sharedX(
             final[i] = best_c if best_c is not None else gclasses[int(np.argmax(gscores[i]))]
     return final
 
-# ---------- Brand & size prediction ----------
+# ---------- Brand & size ----------
 def predict_brand_and_size(train_df: pd.DataFrame, df_to_predict: pd.DataFrame, pred_cat: List[str], text_col: str):
     brand_sorted, canon_map, brand_main_list = build_brand_dictionary(train_df)
     cat_brand_counts = (train_df.groupby(['Categoría','Marca']).size()
@@ -323,7 +413,7 @@ def predict_brand_and_size(train_df: pd.DataFrame, df_to_predict: pd.DataFrame, 
     qty, unit = zip(*[pick_size_for_category(t, c) for t, c in zip(raw_txt, pred_cat)])
     return list(pred_brand), list(qty), list(unit)
 
-# ---------- Valid masks ----------
+# ---------- Valid mask ----------
 def valid_mask_for_text(df: pd.DataFrame, text_col: str, min_len: int = 20) -> pd.Series:
     if text_col not in df.columns:
         return pd.Series(False, index=df.index)
@@ -363,8 +453,12 @@ def evaluate_df(df_true: pd.DataFrame, pred_df: pd.DataFrame) -> pd.DataFrame:
 # ===========================
 # USE IN-MEMORY DFS: Train, Test
 # ===========================
-# Train your models
-vec, cat_clf, sec_clf, sec_cat_models, cat2sec, sec2cats = train_global_models(Train)
+assert 'Train' in globals() and 'Test' in globals(), "Please define Train and Test DataFrames first."
+
+# Train models on OCR-like synthetic text, vectorizer fitted on union corpus
+vec, cat_clf, sec_clf, sec_cat_models, cat2sec, sec2cats = train_global_models(Train, Test,
+                                                                               sample_frac_train_ocr=0.25,
+                                                                               max_vocab_features=350_000)
 
 # -------- TEST inference (ocr_text len>20) --------
 mask_test = valid_mask_for_text(Test, "ocr_text", 20)
@@ -397,7 +491,7 @@ results_test = evaluate_df(
     out_test.loc[mask_test, ["Pred_Sector","Pred_Categoría","Pred_Marca","Pred_Quantity","Pred_Unit"]]
 )
 print(f"\nValid TEST rows (ocr_text len>20): {mask_test.sum()} / {len(Test)}")
-print("\n=== FAST Non-LLM Metrics on TEST (valid subset) ===")
+print("\n=== FAST Non-LLM Metrics on TEST (valid subset) — with OCR-like training text ===")
 with pd.option_context('display.max_colwidth', 200):
     print(results_test.to_string(index=False))
 
@@ -430,5 +524,27 @@ print("\n=== FAST Non-LLM Metrics on TRAIN (valid subset) ===")
 with pd.option_context('display.max_colwidth', 200):
     print(results_train.to_string(index=False))
 
-# # Optional: save predictions
-# out_test.to_csv("/mnt/data/kantar_predictions_nonllm_ensemble.csv", index=False)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
